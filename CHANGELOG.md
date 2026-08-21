@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+## [2.14.0](https://github.com/cedya77/aiometadata/compare/v2.13.0...v2.14.0) (2026-08-21)
+
+
+### Features
+
+* **aiomanager:** offer the sync button in the reinstall notice ([5095606](https://github.com/cedya77/aiometadata/commit/5095606460744f3e5ace7a4e5296fd194fa64fe4))
+* **aiomanager:** show the sync button where Hydra is available ([ca7371e](https://github.com/cedya77/aiometadata/commit/ca7371ed729b9e2e735b77ddc6c11788e34cceff))
+* **collections:** search provider lists from the catalog picker ([9da47b6](https://github.com/cedya77/aiometadata/commit/9da47b68b9c6af6a47a9b13f0f903b88123fd8cf))
+* **filters:** let a content rating keep unrated titles ([38e7588](https://github.com/cedya77/aiometadata/commit/38e7588beff264443091675398f547e4eb6b3d30))
+* **mdblist:** let recommendations be added as movies or series ([a80a17c](https://github.com/cedya77/aiometadata/commit/a80a17c69dbc4205ba4ba93fb85a3fc22cd56257)), closes [#650](https://github.com/cedya77/aiometadata/issues/650)
+* **settings:** make the MDBList list cache TTL configurable ([c6ee5be](https://github.com/cedya77/aiometadata/commit/c6ee5be6b30b74b5f67fafef88fd53de0246e8c1))
+* **settings:** regroup the dashboard settings and add a filter ([c6ee5be](https://github.com/cedya77/aiometadata/commit/c6ee5be6b30b74b5f67fafef88fd53de0246e8c1))
+* **tmdb:** add TMDB collections as catalogs ([1854bf1](https://github.com/cedya77/aiometadata/commit/1854bf12995e92a553d412eb3dd36a6b928b79da))
+* **tvdb:** add TheTVDB lists as catalogs ([8676f57](https://github.com/cedya77/aiometadata/commit/8676f5782180b8e1558bd78e588f44513352e16f))
+* **warming:** add a sync TTL action to the catalog warming task ([5f6c6a9](https://github.com/cedya77/aiometadata/commit/5f6c6a9166ef72902a8a12592eb0970f48f36f99))
+
+
+### Bug Fixes
+
+* **catalogs:** honor the per-catalog cache TTL on PublicMetaDB catalogs ([d5699ba](https://github.com/cedya77/aiometadata/commit/d5699bac2b7e5a8d30b42b969c5c682837a1ff7f))
+* **catalogs:** keep the Home placement when a catalog is disabled ([1a6a060](https://github.com/cedya77/aiometadata/commit/1a6a06034d0175551d3d76c1ddbe6c6a34f09219))
+* **ci:** build the release image from release-please instead of by hand ([b759366](https://github.com/cedya77/aiometadata/commit/b759366de03687391e9338ce5f59d2e35355f3be))
+* **ci:** tag release images with the semver version ([bd8a359](https://github.com/cedya77/aiometadata/commit/bd8a3595bc02df5805b960f95f0b819ab4780643))
+* **ci:** tag release images with the semver version ([2380422](https://github.com/cedya77/aiometadata/commit/23804223ad7b17a8dcf6d2dd1ead96c7ec57a58e))
+* **discover:** sort digital releases by their digital date ([993ba39](https://github.com/cedya77/aiometadata/commit/993ba391f305e0138699f97744d0729c56c441b1)), closes [#664](https://github.com/cedya77/aiometadata/issues/664)
+* **jikan:** apply the rate limit settings set from the dashboard ([1c39dd2](https://github.com/cedya77/aiometadata/commit/1c39dd2ce71e766acdaec5fca76bffc8924508de))
+* **mal:** carry the MAL age rating onto catalog items ([38e7588](https://github.com/cedya77/aiometadata/commit/38e7588beff264443091675398f547e4eb6b3d30))
+* **mdblist:** honor the built-in API key outside quick add ([2bc6471](https://github.com/cedya77/aiometadata/commit/2bc6471c59f676660dc1c5601ff042bec4d2eb6c))
+* **movielens:** offer the hide watched and unreleased overrides ([5906774](https://github.com/cedya77/aiometadata/commit/5906774501531208f6f81e2ab99046cbe6f9ea7d))
+* **settings:** correct the Jikan defaults shown in the dashboard ([1c39dd2](https://github.com/cedya77/aiometadata/commit/1c39dd2ce71e766acdaec5fca76bffc8924508de))
+* **tmdb:** list every language the discover filter accepts ([51d9cb0](https://github.com/cedya77/aiometadata/commit/51d9cb0a7a7a6f00ddcdcb0e6844b9ef75ff73f2)), closes [#659](https://github.com/cedya77/aiometadata/issues/659)
+* **warming:** restore the schedule reset on a forced warm ([5f6c6a9](https://github.com/cedya77/aiometadata/commit/5f6c6a9166ef72902a8a12592eb0970f48f36f99))
+
 ## [2.13.0](https://github.com/cedya77/aiometadata/compare/v2.12.0...v2.13.0) (2026-08-16)
 
 
