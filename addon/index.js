@@ -29,7 +29,7 @@ const consola = require('consola');
 const aiCatalogLogger = consola.withTag('AICatalog');
 const { stripReleaseAvailabilityForResponse } = require('./utils/releaseAvailability');
 
-const { getMediaRatingFromMDBList, supportsMdblistScoreFilters } = require("./utils/mdbList");
+const { getMediaRatingFromMDBList, supportsMdblistScoreFilters, usesMdblistExternalItemsEndpoint } = require("./utils/mdbList");
 
 // Warm user-specific content based on their config
 async function warmUserContent(userUUID, contentType) {
@@ -4380,6 +4380,20 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
   delete cacheExtraArgs.skip;
   if (catalogPage > 1) cacheExtraArgs.page = catalogPage;
 
+  const filtersActive = catalogFiltersActive({
+    config,
+    catalogConfig,
+    cleanId
+  });
+  const isCursorSensitiveMdblistCatalog =
+    cleanId.startsWith('mdblist.') &&
+    usesMdblistExternalItemsEndpoint(catalogConfig);
+  const useCursorPagination = filtersActive || isCursorSensitiveMdblistCatalog;
+
+  if (isCursorSensitiveMdblistCatalog) {
+    cacheExtraArgs._mdblistPaging = 'typed-cursor-v2';
+  }
+
   if (cleanId.startsWith('simkl.watchlist.') || cleanId.startsWith('simkl.upnext')) {
     try {
       const { getSimklToken, getSimklActivityFingerprint } = require('./utils/simklUtils');
@@ -4634,7 +4648,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     const readPage = (page, skipOverride) =>
       cacheWrapper(userUUID, keyForPage(page), () => runCatalogPage(page, skipOverride), cacheOptions);
 
-    if (catalogFiltersActive({ config, catalogConfig, cleanId })) {
+      if (useCursorPagination) {
       const key = cursorKey(userUUID, cleanId, actualType, genreName);
       const skipValue = legacySkip || 0;
       const { startPage, startOffset, matched } = await resolveStartPage(key, skipValue, catalogPage);

@@ -625,12 +625,44 @@ async function getGenresFromMDBList(listId: string, apiKey: string): Promise<str
 }
 
 
-const MDBLIST_BY_NAME_ITEMS_PATTERN = /api\.mdblist\.com\/lists\/[^/]+\/[^/]+\/items/;
+const MDBLIST_API_HOST = 'api.mdblist.com';
+const MDBLIST_BY_NAME_ITEMS_PATH_PATTERN = /^(\/lists\/[^/]+\/[^/]+\/items)(?:\/(?:movie|show))?\/?$/;
+const MDBLIST_EXTERNAL_ITEMS_PATH_PATTERN = /^\/external\/lists\/[^/]+\/items\/?$/;
+
+function parseMdblistApiUrl(sourceUrl: string): URL | null {
+  try {
+    const parsed = new URL(sourceUrl);
+    return parsed.hostname.toLowerCase() === MDBLIST_API_HOST ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeMDBListByNameItemsUrl(url: string, catalogType?: string): string {
+  const mediaType = catalogType === 'movie'
+    ? 'movie'
+    : catalogType === 'series'
+      ? 'show'
+      : null;
+  if (!mediaType) return url;
+
+  const parsed = parseMdblistApiUrl(url);
+  if (!parsed) return url;
+
+  const pathMatch = parsed.pathname.match(MDBLIST_BY_NAME_ITEMS_PATH_PATTERN);
+  if (!pathMatch) return url;
+
+  parsed.pathname = `${pathMatch[1]}/${mediaType}`;
+  return parsed.toString();
+}
 
 function usesMdblistExternalItemsEndpoint(catalogConfig: any): boolean {
   const sourceUrl = catalogConfig?.sourceUrl;
   if (typeof sourceUrl !== 'string') return false;
-  return sourceUrl.includes('/external/lists/') || MDBLIST_BY_NAME_ITEMS_PATTERN.test(sourceUrl);
+  const parsed = parseMdblistApiUrl(sourceUrl);
+  if (!parsed) return false;
+  return MDBLIST_EXTERNAL_ITEMS_PATH_PATTERN.test(parsed.pathname)
+    || MDBLIST_BY_NAME_ITEMS_PATH_PATTERN.test(parsed.pathname);
 }
 
 function supportsMdblistScoreFilters(catalogConfig: any): boolean {
@@ -656,8 +688,9 @@ async function fetchMDBListExternalItems(
   cacheTTL?: number
 ): Promise<{items: any[], totalItems?: number, hasMore?: boolean, totalPages?: number}> {
   const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20;
+  const effectiveUrl = normalizeMDBListByNameItemsUrl(url, catalogType);
 
-  const normalizedUrl = new URL(url);
+  const normalizedUrl = new URL(effectiveUrl);
   normalizedUrl.searchParams.delete('apikey');
   normalizedUrl.searchParams.delete('limit');
   normalizedUrl.searchParams.delete('offset');
@@ -679,7 +712,7 @@ async function fetchMDBListExternalItems(
   try {
     return await cacheWrapGlobal(cacheKey, async () => {
       const offset = (page * pageSize) - pageSize;
-      const urlWithParams = new URL(url);
+        const urlWithParams = new URL(effectiveUrl);
       urlWithParams.searchParams.set('apikey', apiKey);
       urlWithParams.searchParams.set('limit', pageSize.toString());
       urlWithParams.searchParams.set('offset', offset.toString());
@@ -709,7 +742,7 @@ async function fetchMDBListExternalItems(
       const response: any = await makeRateLimitedRequest(
         () => httpGet(fullUrl, { dispatcher: mdblistDispatcher }),
         apiKey,
-        `MDBList fetchMDBListExternalItems (url: ${sanitizeUrlForLogging(url)}, page: ${page})`
+          `MDBList fetchMDBListExternalItems (url: ${sanitizeUrlForLogging(effectiveUrl)}, page: ${page})`
       );
 
       const hasMore = response.headers?.['x-has-more'] === 'true';
@@ -744,7 +777,7 @@ async function fetchMDBListExternalItems(
       return { items, hasMore };
     }, ttl, { upstream: true });
   } catch (err: any) {
-    logger.error(`Error retrieving items from URL ${sanitizeUrlForLogging(url)}, page ${page}:`, err.message);
+      logger.error(`Error retrieving items from URL ${sanitizeUrlForLogging(effectiveUrl)}, page ${page}:`, err.message);
     return { items: [] };
   }
 }
@@ -1717,6 +1750,7 @@ async function fetchMDBListCatalog(
 export {
   fetchMDBListItems,
   fetchMDBListExternalItems,
+  normalizeMDBListByNameItemsUrl,
   usesMdblistExternalItemsEndpoint,
   supportsMdblistScoreFilters,
   fetchMDBListBatchMediaInfo,
@@ -1735,4 +1769,3 @@ export {
   checkinEpisode,
   fetchMDBListCatalog
 };
-

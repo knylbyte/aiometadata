@@ -16,6 +16,7 @@
     "prebuild:backend": "npm run generate:build-info",
     "build:backend": "tsc -p tsconfig.backend.json",
     "build:backend:watch": "tsc -p tsconfig.backend.json --watch",
+    "test:backend": "npm run build:backend && node --test --test-force-exit test/*.test.js",
     "start:backend": "node dist/server/server.js",
     "prestart:backend:ts": "npm run generate:build-info",
     "start:backend:ts": "ts-node addon/server.ts",
