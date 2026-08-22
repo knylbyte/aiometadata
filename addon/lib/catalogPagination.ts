@@ -9,6 +9,7 @@ export interface CatalogCursor {
   served: number;
   upstreamPage: number;
   pageOffset: number;
+  pageSize?: number;
 }
 
 export function fillMaxPages(): number {
@@ -73,7 +74,8 @@ export async function clearCursor(key: string): Promise<void> {
 export async function resolveStartPage(
   key: string,
   skip: number,
-  legacyPage: number
+  legacyPage: number,
+  legacyOffset: number = 0
 ): Promise<{ startPage: number; startOffset: number; matched: boolean }> {
   if (skip === 0) {
     await clearCursor(key);
@@ -84,7 +86,7 @@ export async function resolveStartPage(
   if (cursor && cursor.served === skip) {
     return { startPage: cursor.upstreamPage, startOffset: cursor.pageOffset || 0, matched: true };
   }
-  return { startPage: legacyPage, startOffset: 0, matched: false };
+  return { startPage: legacyPage, startOffset: legacyOffset, matched: false };
 }
 
 export interface FillResult {
@@ -99,11 +101,13 @@ export async function fillFilteredPage(options: {
   startPage: number;
   startOffset?: number;
   pageSize: number;
+  sourcePageSize?: number;
   maxPages?: number;
   fetchPage: (page: number) => Promise<any[]>;
   filter: (metas: any[]) => Promise<any[]>;
 }): Promise<FillResult> {
   const { startPage, pageSize, fetchPage, filter } = options;
+  const sourcePageSize = options.sourcePageSize ?? pageSize;
   const maxPages = options.maxPages ?? fillMaxPages();
 
   const metas: any[] = [];
@@ -135,7 +139,7 @@ export async function fillFilteredPage(options: {
     offset = 0;
     page += 1;
 
-    if (raw.length < pageSize) {
+    if (raw.length < sourcePageSize) {
       exhausted = true;
       break;
     }

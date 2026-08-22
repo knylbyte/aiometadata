@@ -307,9 +307,8 @@ async function makeRateLimitedRequest<T>(
   throw new Error(`[${context}] All ${retries} attempts failed.`);
 }
 
-async function fetchMDBListItems(listId: string, apiKey: string, language: string, page: number, sort?: string, order?: string, genre?: string, unified?: boolean, catalogType?: string, cacheTTL?: number, filterScoreMin?: number, filterScoreMax?: number, mediaTypeFilter?: string): Promise<{items: any[], totalItems?: number, hasMore?: boolean, totalPages?: number}> {
-  // Use configurable page size (supports CATALOG_LIST_ITEMS_SIZE env var)
-  const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20;
+async function fetchMDBListItems(listId: string, apiKey: string, language: string, page: number, sort?: string, order?: string, genre?: string, unified?: boolean, catalogType?: string, cacheTTL?: number, filterScoreMin?: number, filterScoreMax?: number, mediaTypeFilter?: string, pageSizeOverride?: number): Promise<{items: any[], totalItems?: number, hasMore?: boolean, totalPages?: number}> {
+  const pageSize = Math.min(100, Math.max(1, pageSizeOverride || parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20));
 
   const keyScope = (listId === 'watchlist' || listId.startsWith('recommended/'))
     ? crypto.createHash('sha256').update(apiKey).digest('hex').substring(0, 16)
@@ -685,9 +684,10 @@ async function fetchMDBListExternalItems(
   unified?: boolean,
   filterScoreMin?: number,
   filterScoreMax?: number,
-  cacheTTL?: number
+  cacheTTL?: number,
+  pageSizeOverride?: number
 ): Promise<{items: any[], totalItems?: number, hasMore?: boolean, totalPages?: number}> {
-  const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20;
+  const pageSize = Math.min(100, Math.max(1, pageSizeOverride || parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20));
   const effectiveUrl = normalizeMDBListByNameItemsUrl(url, catalogType);
 
   const normalizedUrl = new URL(effectiveUrl);
@@ -1668,14 +1668,15 @@ async function fetchMDBListCatalog(
   apiKey: string,
   page: number,
   params: Record<string, string | number | boolean>,
-  cacheTTL?: number
+  cacheTTL?: number,
+  pageSizeOverride?: number
 ): Promise<{ items: any[]; hasMore: boolean }> {
-  const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20;
+  const pageSize = Math.min(100, Math.max(1, pageSizeOverride || parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20));
 
   const paramEntries = Object.entries(params).filter(([k]) => k !== 'cursor' && k !== 'limit').sort(([a], [b]) => a.localeCompare(b));
-  const paramsHash = crypto.createHash('sha256').update(JSON.stringify(paramEntries)).digest('hex').substring(0, 16);
+  const paramsHash = crypto.createHash('sha256').update(JSON.stringify({ paramEntries, pageSize })).digest('hex').substring(0, 16);
 
-  const responseCacheKey = `mdblist-api:catalog:${paramsHash}:${mediaType}:page:${page}`;
+  const responseCacheKey = `mdblist-api:catalog:${paramsHash}:${mediaType}:page:${page}:pageSize:${pageSize}`;
   // MDBList caches catalog results server-side for 6 hours 
   const maxTtl = 6 * 60 * 60;
   const baseTtl = cacheTTL !== undefined ? cacheTTL : parseInt(process.env.CATALOG_TTL || String(maxTtl), 10);

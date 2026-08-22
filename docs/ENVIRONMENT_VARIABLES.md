@@ -533,10 +533,23 @@ These caps bound the per-process heap used by module-level caches. The defaults 
 
 ## Catalog Configuration
 
+### `CATALOG_PAGE_SIZE_MODE`
+- **Default**: `fixed`
+- **Values**: `fixed`, `request`
+- **Description**: In `fixed` mode every catalog response uses `CATALOG_LIST_ITEMS_SIZE` and ignores client limits. In `request` mode a valid client limit is used and remembered in the catalog cursor for follow-up requests.
+- **Supported Requests**: `?limit=100` and `?extra=limit%3D100`
+
 ### `CATALOG_LIST_ITEMS_SIZE`
 - **Default**: `20`
-- **Description**: Number of items per catalog page
-- **Example**: `CATALOG_LIST_ITEMS_SIZE=30`
+- **Range**: `1` to `100`
+- **Description**: Fixed catalog page size used when `CATALOG_PAGE_SIZE_MODE=fixed`.
+- **Example**: `CATALOG_LIST_ITEMS_SIZE=20`
+
+### `CATALOG_REQUEST_LIMIT_FALLBACK`
+- **Default**: `20`
+- **Range**: `1` to `100`
+- **Description**: Page size used in request mode when the client sends no valid limit and no matching catalog cursor stores the sequence's page size.
+- **Example**: `CATALOG_REQUEST_LIMIT_FALLBACK=20`
 
 ### `MAX_CATALOGS`
 - **Optional**: Yes

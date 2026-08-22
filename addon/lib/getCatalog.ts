@@ -33,6 +33,7 @@ import redis from './redisClient.js';
 const logger = consola.withTag('Catalog');
 import { cacheWrapMetaSmart } from './getCache.js';
 import { UserConfig } from '../types/index.js';
+import { catalogRequestPageSize } from './catalogPageSize.js';
 
 const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p/w500';
 const TVDB_IMAGE_BASE = 'https://artworks.thetvdb.com';
@@ -385,7 +386,7 @@ async function getTvmazeScheduleHandler(
   const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
   const date = formatter.format(new Date());
   const country = genre && genre !== 'None' ? genre.toUpperCase() : '';
-  const pageSize = 20;
+  const pageSize = catalogRequestPageSize();
 
   const result = await getTvmazeScheduleCatalog({
     date,
@@ -592,7 +593,7 @@ async function getTvdbCatalog(type: string, catalogId: string, genreName: string
   const sortedResults = filteredResults.sort((a: any, b: any) => b.score - a.score);
   
   // Apply client-side pagination
-  const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE || '20');
+  const pageSize = catalogRequestPageSize();
   const startIndex = (page - 1) * pageSize;
   const endIndex = startIndex + pageSize;
   const paginatedResults = sortedResults.slice(startIndex, endIndex);
@@ -687,7 +688,7 @@ async function getTvdbListCatalog(type: string, id: string, page: number, langua
   const wantsSeries = configuredType === 'series' || configuredType === 'all';
   const selected = entities.filter((e: any) => (e.movieId && wantsMovies) || (e.seriesId && wantsSeries));
 
-  const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE || '20');
+  const pageSize = catalogRequestPageSize();
   const listPage = typeof page === 'number' ? page : parseInt(String(page), 10) || 1;
   const startIndex = Math.max(0, (listPage - 1) * pageSize);
   const pageEntities = selected.slice(startIndex, startIndex + pageSize);
@@ -762,7 +763,7 @@ async function getTvdbDiscoverCatalog(
 
   const tvdbType = isMovieCatalog ? 'movies' : 'series';
   const discoverPage = typeof page === 'number' ? page : parseInt(String(page), 10) || 1;
-  const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE || '20');
+  const pageSize = catalogRequestPageSize();
 
   try {
     const response = await tvdb.filter(tvdbType, parameters, config);
@@ -830,7 +831,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
 
       const mediaType = type === 'movie' ? 'movie' : 'show';
       const { fetchMDBListCatalog } = await import('../utils/mdbList.js');
-      const response = await fetchMDBListCatalog(mediaType, apiKey, page, params, catalogConfig?.cacheTTL);
+      const response = await fetchMDBListCatalog(mediaType, apiKey, page, params, catalogConfig?.cacheTTL, catalogRequestPageSize());
 
       // Catalog endpoint returns a different shape than list items:
       // { title, year, score, type, ids: { imdbid, tmdbid, traktid, ... } }
@@ -864,7 +865,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
         return [];
       }
       
-      const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20;
+      const pageSize = catalogRequestPageSize();
       // Ensure page is a number
       const pageNum = typeof page === 'number' ? page : parseInt(String(page), 10) || 1;
       const hideUnreleased = catalogConfig?.metadata?.hideUnreleased;
@@ -921,7 +922,8 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
         unified,
         filterScoreMin,
         filterScoreMax,
-        catalogConfig?.cacheTTL
+        catalogConfig?.cacheTTL,
+        catalogRequestPageSize()
       );
 
       let metas = await parseMDBListItems(response.items, type, language, config, includeVideos);
@@ -983,7 +985,8 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       catalogConfig?.cacheTTL,
       scoreFiltersAllowed ? catalogConfig?.filter_score_min : undefined,
       scoreFiltersAllowed ? catalogConfig?.filter_score_max : undefined,
-      mediaTypeFilter
+      mediaTypeFilter,
+      catalogRequestPageSize()
     );
     
     // Smart pagination handling
@@ -1015,7 +1018,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       
       // Performance warning for large offsets
       if (page > 50) {
-        logger.warn(`MDBList performance warning - requesting page ${page} (offset ${(page - 1) * (parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20)}) for list ${listId}`);
+        logger.warn(`MDBList performance warning - requesting page ${page} (offset ${(page - 1) * catalogRequestPageSize()}) for list ${listId}`);
       }
     }
     
@@ -1201,7 +1204,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
         return collectionMeta.sortDirection === 'desc' ? right.localeCompare(left) : left.localeCompare(right);
       });
 
-      const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20;
+      const pageSize = catalogRequestPageSize();
       const pageNum = typeof page === 'number' ? page : parseInt(String(page), 10) || 1;
       const pageParts = parts.slice((pageNum - 1) * pageSize, (pageNum - 1) * pageSize + pageSize);
       if (!pageParts.length) return [];
@@ -1252,7 +1255,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
     }
     
     try {
-      const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20;
+      const pageSize = catalogRequestPageSize();
       const pageNum = typeof page === 'number' ? page : parseInt(String(page), 10) || 1;
       
       logger.debug(`[TMDB List] Fetching list ${listId}, page ${pageNum}, pageSize ${pageSize}`);
@@ -1843,7 +1846,7 @@ async function getExternalAddonCatalog(type: string, catalogId: string, genre: s
 
     const catalogUrl = userCatalog.sourceUrl || userCatalog.source;
     const catalogTTL = userCatalog.cacheTTL ?? parseInt(process.env.CATALOG_TTL || String(24 * 60 * 60), 10);
-    const batchSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE || '20');
+    const batchSize = catalogRequestPageSize();
     const useCursor = skip !== undefined && redis;
     const stremioSkip = skip ?? (page - 1) * batchSize;
 
@@ -1893,7 +1896,7 @@ async function getExternalAddonCatalog(type: string, catalogId: string, genre: s
     let batchesRead = 0;
 
     const filtersActive = catalogFiltersActive({ config, catalogConfig: userCatalog, cleanId: catalogId });
-    const maxBatches = filtersActive ? fillMaxPages() : 1;
+    const maxBatches = Math.max(filtersActive ? fillMaxPages() : 1, batchSize);
 
     while (collected.length < batchSize && batchesRead < maxBatches) {
       const items = await readBatch(offset);
@@ -1967,7 +1970,7 @@ async function getTraktCatalog(
   try {
     logger.info(`Fetching Trakt catalog: ${catalogId}, Genre: ${genre}, Page: ${page}`);
 
-    const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20;
+    const pageSize = catalogRequestPageSize();
 
     const catalogConfig = config.catalogs?.find(c => c.id === catalogId);
     const sort = catalogConfig?.sort === 'default' ? undefined : catalogConfig?.sort;
@@ -2402,7 +2405,7 @@ async function getAniListCatalog(
       return [];
     }
     
-    const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20;
+    const pageSize = Math.min(catalogRequestPageSize(), 50);
     
     // Get custom cache TTL and sort option from catalog config if specified
     const customCacheTTL = catalogConfig?.cacheTTL || null;
@@ -2561,7 +2564,7 @@ async function getMalUserListCatalog(
     }
 
     const catalogConfig = config.catalogs?.find(c => c.id === catalogId);
-    const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20;
+    const pageSize = catalogRequestPageSize();
     const offset = (page - 1) * pageSize;
     const sort = catalogConfig?.sort || 'list_updated_at';
     const nsfw = !config.sfw;
@@ -2662,7 +2665,7 @@ async function getLetterboxdCatalog(
     }
 
     // Calculate pagination - use configurable page size (supports CATALOG_LIST_ITEMS_SIZE env var)
-    const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20;
+    const pageSize = catalogRequestPageSize();
     const startIndex = (page - 1) * pageSize;
     const endIndex = startIndex + pageSize;
     const pageItems = filteredItems.slice(startIndex, endIndex);
@@ -2841,7 +2844,7 @@ async function getMovieLensCatalog(
     }
 
     const catalogConfig = config.catalogs?.find(c => c.id === catalogId);
-    const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE || '20');
+    const pageSize = catalogRequestPageSize();
     const ttl = catalogConfig?.cacheTTL !== undefined
       ? catalogConfig.cacheTTL
       : parseInt(process.env.MOVIELENS_CATALOG_TTL_SECONDS || '3600', 10);
@@ -2945,8 +2948,8 @@ async function getSimklCatalog(
     
     // For watchlists, use default pageSize (Simkl doesn't support pagination, we do local pagination)
     // For trending, use configured pageSize
-    const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE || '20')
-    const discoverPageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE || '20');
+    const pageSize = catalogRequestPageSize();
+    const discoverPageSize = catalogRequestPageSize();
 
     if (catalogId === 'simkl.upnext' || catalogId === 'simkl.upnext.anime') {
       const animeOnly = catalogId === 'simkl.upnext.anime';
@@ -3075,7 +3078,7 @@ async function getSimklCatalog(
       response = { items, hasMore: result.hasMore, totalItems: result.totalItems };
     } else if (catalogId.startsWith('simkl.calendar')) {
       // Simkl Calendar - Shows airing soon
-      const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE || '20');
+      const pageSize = catalogRequestPageSize();
       
       // Get timezone from config or default to UTC
       const timezone = config.timezone || process.env.TZ || 'UTC';
@@ -3312,7 +3315,7 @@ async function getPublicMetaDBCatalog(
 
     if (catalogId.startsWith('publicmetadb.list.')) {
       const listId = catalogId.replace('publicmetadb.list.', '');
-      const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20;
+      const pageSize = catalogRequestPageSize();
       const data = await fetchListItems(apiKey, listId, page, pageSize);
       let metas = await parseListItems(data.items || [], type, language, config);
       logger.success(`[PublicMetaDB] List ${listId}: ${metas.length} items (page ${page})`);
@@ -3426,7 +3429,7 @@ async function getMergedCatalog(
   if (validSources.length === 0) return [];
 
   const { applyCatalogFilters } = require('../utils/catalogFilters.js');
-  const pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20;
+  const pageSize = catalogRequestPageSize();
   const stremioSkip = skip ?? (page - 1) * pageSize;
   const hasGenreFilter = !!(genre && genre !== 'None' && normalizeGenreKey(genre));
   const catalogTTL = parseInt(process.env.CATALOG_TTL || String(24 * 60 * 60), 10);
