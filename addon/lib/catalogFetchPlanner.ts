@@ -1,14 +1,55 @@
-import { envInt } from '../utils/envNumber';
+import { createHash } from 'node:crypto';
 
-export const CATALOG_CANONICAL_CACHE_VERSION = 'canonical-v3';
+export const CATALOG_CANONICAL_CACHE_VERSION = 'canonical-v4';
+export const CATALOG_CANONICAL_PAGE_SCHEMA = 'v4';
+
+export type CatalogExhaustion = 'confirmed' | 'not-exhausted' | 'unknown';
+
+export type ProviderResumeState =
+  | { kind: 'offset'; offset: number }
+  | { kind: 'page-index'; page: number; index: number }
+  | { kind: 'cursor'; token: string; index?: number };
+
+export interface ReconstructedCatalogEntry {
+  meta: any;
+  sourcePosition: ProviderResumeState;
+  resumeAfter: ProviderResumeState;
+}
+
+export interface ProviderBatchResult {
+  entries: ReconstructedCatalogEntry[];
+  rawCount: number;
+  resumeAfterBatch: ProviderResumeState;
+  exhaustion: CatalogExhaustion;
+  supported?: boolean;
+}
 
 export interface CatalogProviderCapabilities {
   supportsOffset: boolean;
   supportsVariableLimit: boolean;
   maxLimit: number;
+  nativePageSize?: number;
   cursorBased: boolean;
   stableOrdering: boolean;
-  fixedPageSize: number;
+}
+
+export interface CatalogFetchBatch {
+  resumeState: ProviderResumeState;
+  requestedRawCount: number;
+  limit: number;
+  offset?: number;
+  providerPage?: number;
+  pageOffset?: number;
+  sequential: boolean;
+}
+
+export interface CatalogSourceAdapter {
+  provider: string;
+  sourceIdentity: string;
+  querySignature: string;
+  capabilities: CatalogProviderCapabilities;
+  initialResumeState: ProviderResumeState;
+  fetchBatch: (request: CatalogFetchBatch) => Promise<ProviderBatchResult>;
 }
 
 export interface CanonicalPageWindow {
@@ -30,34 +71,102 @@ export interface MissingPageRange {
   limit: number;
 }
 
-export interface CatalogFetchBatch {
-  offset: number;
-  limit: number;
-  providerPage: number;
-  pageOffset: number;
-  sequential: boolean;
-}
-
-export interface CatalogBatchResult {
-  items: any[];
-  rawCount?: number;
-  nextOffset?: number;
-  exhausted: boolean;
-  supported?: boolean;
-}
-
 export interface CanonicalCatalogPage {
   metas: any[];
-  _canonical?: {
-    version: string;
-    sourceStartOffset: number;
-    sourceNextOffset?: number;
+  _canonical: {
+    schema: 'v4';
+    page: number;
+    sourceStart: ProviderResumeState;
+    sourceNext: ProviderResumeState;
     exhausted: boolean;
+    entryResumes: ProviderResumeState[];
   };
+}
+
+export interface CanonicalTerminalState {
+  schema: 'v4';
+  sourceEnd: ProviderResumeState;
+  lastCanonicalPage: number;
+}
+
+export class CatalogProviderNoProgressError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CatalogProviderNoProgressError';
+  }
 }
 
 function positiveInteger(value: number, fallback: number): number {
   return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function stableValue(value: any): any {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === 'object') {
+    return Object.keys(value).sort().reduce((result: Record<string, any>, key) => {
+      const child = value[key];
+      if (child !== undefined && typeof child !== 'function') result[key] = stableValue(child);
+      return result;
+    }, {});
+  }
+  return value;
+}
+
+export function stableCatalogStringify(value: any): string {
+  return JSON.stringify(stableValue(value));
+}
+
+export function buildCatalogQuerySignature(input: {
+  catalogId: string;
+  type: string;
+  language?: string;
+  canonicalPageSize: number;
+  args?: Record<string, unknown>;
+  catalogConfig?: any;
+  configFingerprint?: unknown;
+}): string {
+  const args = { ...(input.args || {}) };
+  for (const key of [
+    'skip',
+    'limit',
+    'page',
+    '_pageSize',
+    '_pageOffset',
+    '_catalogPaging',
+    '_canonicalPageSize',
+    '_querySignature',
+    '_mdblistPaging',
+  ]) delete (args as any)[key];
+  const payload = {
+    catalogId: input.catalogId,
+    type: input.type,
+    language: input.language || '',
+    canonicalPageSize: positiveInteger(input.canonicalPageSize, 20),
+    args,
+    catalogConfig: input.catalogConfig || null,
+    configFingerprint: input.configFingerprint || null,
+  };
+  return createHash('sha256').update(stableCatalogStringify(payload)).digest('hex').slice(0, 32);
+}
+
+export function resumeStateKey(state: ProviderResumeState): string {
+  return stableCatalogStringify(state);
+}
+
+export function resumeStatesEqual(a?: ProviderResumeState | null, b?: ProviderResumeState | null): boolean {
+  return !!a && !!b && resumeStateKey(a) === resumeStateKey(b);
+}
+
+export function isProviderResumeState(value: any): value is ProviderResumeState {
+  if (!value || typeof value !== 'object') return false;
+  if (value.kind === 'offset') return Number.isInteger(value.offset) && value.offset >= 0;
+  if (value.kind === 'page-index') {
+    return Number.isInteger(value.page) && value.page > 0 && Number.isInteger(value.index) && value.index >= 0;
+  }
+  if (value.kind === 'cursor') {
+    return typeof value.token === 'string' && (value.index === undefined || (Number.isInteger(value.index) && value.index >= 0));
+  }
+  return false;
 }
 
 export function resolveCanonicalPageWindow(
@@ -69,10 +178,8 @@ export function resolveCanonicalPageWindow(
   const normalizedSkip = Number.isInteger(skip) && skip >= 0 ? skip : 0;
   const limit = positiveInteger(responseLimit, size);
   const startPage = Math.floor(normalizedSkip / size) + 1;
-  const endExclusive = normalizedSkip + limit;
-  const endPage = Math.max(startPage, Math.ceil(endExclusive / size));
+  const endPage = Math.max(startPage, Math.ceil((normalizedSkip + limit) / size));
   const pages = Array.from({ length: endPage - startPage + 1 }, (_, index) => startPage + index);
-
   return {
     skip: normalizedSkip,
     responseLimit: limit,
@@ -95,180 +202,41 @@ export function planMissingPageRanges(
   const cached = new Set(cachedPages);
   const missing = [...new Set(pages)].filter(page => page > 0 && !cached.has(page)).sort((a, b) => a - b);
   const ranges: MissingPageRange[] = [];
-
   for (const page of missing) {
     const previous = ranges[ranges.length - 1];
     if (previous && previous.endPage + 1 === page) {
       previous.endPage = page;
       previous.limit += size;
-      continue;
+    } else {
+      ranges.push({ startPage: page, endPage: page, offset: (page - 1) * size, limit: size });
     }
-    ranges.push({
-      startPage: page,
-      endPage: page,
-      offset: (page - 1) * size,
-      limit: size,
-    });
   }
-
   return ranges;
-}
-
-export function resolveCatalogProviderCapabilities(
-  catalogId: string,
-  _catalogConfig: any,
-  canonicalPageSize: number
-): CatalogProviderCapabilities {
-  const size = positiveInteger(canonicalPageSize, 20);
-  const id = String(catalogId || '');
-
-  if (id.startsWith('mdblist.discover.') || id === 'mdblist.upnext') {
-    return {
-      supportsOffset: false,
-      supportsVariableLimit: false,
-      maxLimit: size,
-      cursorBased: true,
-      stableOrdering: true,
-      fixedPageSize: size,
-    };
-  }
-
-  if (id.startsWith('mdblist.')) {
-    return {
-      supportsOffset: true,
-      supportsVariableLimit: true,
-      maxLimit: 100,
-      cursorBased: false,
-      stableOrdering: true,
-      fixedPageSize: size,
-    };
-  }
-
-  let fixedPageSize = size;
-  if (id.startsWith('tmdb.') || id.startsWith('streaming.')) fixedPageSize = 20;
-  else if (id.startsWith('flixpatrol.')) fixedPageSize = 10;
-  else if (id.startsWith('mal.') && !id.startsWith('mal.userlist.') && id !== 'mal.suggestions') {
-    fixedPageSize = envInt('MAL_PAGE_SIZE', 25, 1);
-  } else if (id.startsWith('anilist.')) {
-    fixedPageSize = Math.min(50, size);
-  }
-
-  return {
-    supportsOffset: id.startsWith('custom.') || id.startsWith('stremthru.') || id.startsWith('merged.'),
-    supportsVariableLimit: false,
-    maxLimit: fixedPageSize,
-    cursorBased: false,
-    stableOrdering: true,
-    fixedPageSize,
-  };
-}
-
-export function planProviderFetchBatches(
-  ranges: MissingPageRange[],
-  capabilities: CatalogProviderCapabilities,
-  canonicalPageSize: number
-): CatalogFetchBatch[] {
-  const size = positiveInteger(canonicalPageSize, 20);
-  const batches: CatalogFetchBatch[] = [];
-
-  for (const range of ranges) {
-    if (capabilities.supportsOffset && capabilities.supportsVariableLimit && !capabilities.cursorBased) {
-      const configuredMax = positiveInteger(capabilities.maxLimit, size);
-      const alignedMax = configuredMax >= size
-        ? Math.max(size, Math.floor(configuredMax / size) * size)
-        : configuredMax;
-      let offset = range.offset;
-      let remaining = range.limit;
-      while (remaining > 0) {
-        const limit = Math.min(remaining, alignedMax);
-        batches.push({
-          offset,
-          limit,
-          providerPage: Math.floor(offset / size) + 1,
-          pageOffset: 0,
-          sequential: false,
-        });
-        offset += limit;
-        remaining -= limit;
-      }
-      continue;
-    }
-
-    const sourceSize = positiveInteger(capabilities.fixedPageSize, size);
-    let offset = range.offset;
-    const endOffset = range.offset + range.limit;
-    while (offset < endOffset) {
-      const providerPage = Math.floor(offset / sourceSize) + 1;
-      const pageOffset = offset % sourceSize;
-      const limit = Math.min(sourceSize - pageOffset, endOffset - offset);
-      batches.push({
-        offset,
-        limit,
-        providerPage,
-        pageOffset,
-        sequential: true,
-      });
-      offset += limit;
-    }
-  }
-
-  return batches;
 }
 
 export function buildCanonicalCatalogCacheArgs(
   args: Record<string, unknown>,
   page: number,
-  canonicalPageSize: number
+  canonicalPageSize: number,
+  querySignature?: string
 ): Record<string, unknown> {
   const normalized = { ...args };
-  delete normalized.skip;
-  delete normalized.limit;
-  delete normalized.page;
-  delete normalized._pageSize;
-  delete normalized._pageOffset;
+  for (const key of ['skip', 'limit', 'page', '_pageSize', '_pageOffset']) delete (normalized as any)[key];
   normalized._catalogPaging = CATALOG_CANONICAL_CACHE_VERSION;
   normalized._canonicalPageSize = positiveInteger(canonicalPageSize, 20);
+  if (querySignature) normalized._querySignature = querySignature;
   if (page > 1) normalized.page = page;
   return normalized;
 }
 
-export function splitIntoCanonicalPages(
-  items: any[],
-  startPage: number,
-  canonicalPageSize: number,
-  exhausted: boolean,
-  sourceStartOffset: number = (startPage - 1) * canonicalPageSize,
-  sourceNextOffset?: number,
-  rawCount?: number
-): Map<number, CanonicalCatalogPage> {
-  const size = positiveInteger(canonicalPageSize, 20);
-  const pages = new Map<number, CanonicalCatalogPage>();
-  const totalRaw = rawCount ?? items.length;
-
-  for (let index = 0; index < items.length; index += size) {
-    const metas = items.slice(index, index + size);
-    const isFull = metas.length === size;
-    if (!isFull && !exhausted) break;
-
-    const page = startPage + Math.floor(index / size);
-    const isLastWrittenPage = index + metas.length >= items.length;
-    const offsetsAreOneToOne = totalRaw === items.length;
-    const pageNextOffset = offsetsAreOneToOne
-      ? sourceStartOffset + index + metas.length
-      : (isLastWrittenPage ? sourceNextOffset : undefined);
-
-    pages.set(page, {
-      metas,
-      _canonical: {
-        version: CATALOG_CANONICAL_CACHE_VERSION,
-        sourceStartOffset,
-        ...(pageNextOffset !== undefined ? { sourceNextOffset: pageNextOffset } : {}),
-        exhausted: exhausted && isLastWrittenPage,
-      },
-    });
-  }
-
-  return pages;
+export function isCanonicalV4Page(value: any, page?: number): value is CanonicalCatalogPage {
+  return !!value
+    && Array.isArray(value.metas)
+    && value._canonical?.schema === CATALOG_CANONICAL_PAGE_SCHEMA
+    && (page === undefined || value._canonical.page === page)
+    && isProviderResumeState(value._canonical.sourceStart)
+    && isProviderResumeState(value._canonical.sourceNext)
+    && Array.isArray(value._canonical.entryResumes);
 }
 
 export function assembleCanonicalResponse(
@@ -280,167 +248,378 @@ export function assembleCanonicalResponse(
     const cached = pages.get(page);
     if (!cached) break;
     metas.push(...cached.metas);
-    if (cached.metas.length < window.canonicalPageSize) break;
+    if (cached._canonical.exhausted || cached.metas.length < window.canonicalPageSize) break;
   }
   return metas.slice(window.startOffset, window.startOffset + window.responseLimit);
 }
 
+function offsetEntries(items: any[], sourceOffset: number): ReconstructedCatalogEntry[] {
+  return items.map((meta, index) => ({
+    meta,
+    sourcePosition: { kind: 'offset', offset: sourceOffset + index },
+    resumeAfter: { kind: 'offset', offset: sourceOffset + index + 1 },
+  }));
+}
+
+export function splitIntoCanonicalPages(
+  values: ReconstructedCatalogEntry[] | any[],
+  startPage: number,
+  canonicalPageSize: number,
+  exhaustion: CatalogExhaustion | boolean = 'unknown',
+  sourceStart: ProviderResumeState | number = { kind: 'offset', offset: (startPage - 1) * canonicalPageSize }
+): Map<number, CanonicalCatalogPage> {
+  const size = positiveInteger(canonicalPageSize, 20);
+  const start = typeof sourceStart === 'number' ? { kind: 'offset' as const, offset: sourceStart } : sourceStart;
+  const entries: ReconstructedCatalogEntry[] = values.length && values[0]?.meta !== undefined
+    ? values as ReconstructedCatalogEntry[]
+    : offsetEntries(values as any[], start.kind === 'offset' ? start.offset : 0);
+  const confirmed = exhaustion === true || exhaustion === 'confirmed';
+  const result = new Map<number, CanonicalCatalogPage>();
+  let pageStart = start;
+  for (let index = 0; index < entries.length; index += size) {
+    const chunk = entries.slice(index, index + size);
+    const full = chunk.length === size;
+    if (!full && !confirmed) break;
+    const page = startPage + Math.floor(index / size);
+    const last = index + chunk.length >= entries.length;
+    const sourceNext = chunk.length ? chunk[chunk.length - 1].resumeAfter : pageStart;
+    result.set(page, {
+      metas: chunk.map(entry => entry.meta),
+      _canonical: {
+        schema: CATALOG_CANONICAL_PAGE_SCHEMA,
+        page,
+        sourceStart: pageStart,
+        sourceNext,
+        exhausted: confirmed && last,
+        entryResumes: chunk.map(entry => entry.resumeAfter),
+      },
+    });
+    pageStart = sourceNext;
+  }
+  return result;
+}
+
+export async function writeCanonicalPages(
+  pages: Map<number, CanonicalCatalogPage>,
+  writePage: (page: number, value: CanonicalCatalogPage) => Promise<CanonicalCatalogPage | void>
+): Promise<Map<number, CanonicalCatalogPage>> {
+  const written = new Map<number, CanonicalCatalogPage>();
+  await Promise.all([...pages.entries()].sort(([a], [b]) => a - b).map(async ([page, value]) => {
+    const stored = await writePage(page, value);
+    written.set(page, stored || value);
+  }));
+  return written;
+}
+
+function requestForResume(
+  resumeState: ProviderResumeState,
+  requestedRawCount: number,
+  capabilities: CatalogProviderCapabilities
+): CatalogFetchBatch {
+  const request: CatalogFetchBatch = {
+    resumeState,
+    requestedRawCount,
+    limit: requestedRawCount,
+    sequential: !capabilities.supportsVariableLimit || capabilities.cursorBased,
+  };
+  if (resumeState.kind === 'offset') request.offset = resumeState.offset;
+  if (resumeState.kind === 'page-index') {
+    request.providerPage = resumeState.page;
+    request.pageOffset = resumeState.index;
+  }
+  return request;
+}
+
 export function createSequentialPageBatchFetcher(
   capabilities: CatalogProviderCapabilities,
-  fetchPage: (page: number) => Promise<any[]>
-): (batch: CatalogFetchBatch) => Promise<CatalogBatchResult> {
-  const sourceSize = positiveInteger(capabilities.fixedPageSize, 20);
-
-  return async (batch: CatalogFetchBatch): Promise<CatalogBatchResult> => {
-    const items: any[] = [];
-    let absoluteOffset = batch.offset;
-    let exhausted = false;
-
-    while (items.length < batch.limit) {
-      const providerPage = Math.floor(absoluteOffset / sourceSize) + 1;
-      const pageOffset = absoluteOffset % sourceSize;
-      const raw = await fetchPage(providerPage);
-      if (!raw.length) {
-        exhausted = true;
-        break;
-      }
-
-      const available = raw.slice(pageOffset);
-      const taken = available.slice(0, batch.limit - items.length);
-      items.push(...taken);
-      absoluteOffset += taken.length;
-
-      if (raw.length < sourceSize && pageOffset + taken.length >= raw.length) {
-        // A short reconstructed page can be caused by invalid IDs or missing
-        // metadata. Advance to the next provider page and require an empty page
-        // before treating the upstream as exhausted.
-        absoluteOffset = providerPage * sourceSize;
-        continue;
-      }
-      if (!taken.length) {
-        exhausted = raw.length < sourceSize;
-        break;
-      }
-    }
-
-    return {
-      items,
-      rawCount: items.length,
-      nextOffset: absoluteOffset,
-      exhausted,
-    };
+  fetchPage: (page: number) => Promise<any[] | {
+    items?: any[];
+    metas?: any[];
+    entries?: ReconstructedCatalogEntry[];
+    rawCount?: number;
+    exhaustion?: CatalogExhaustion;
+    resumeAfterBatch?: ProviderResumeState;
+  }>
+): (request: CatalogFetchBatch) => Promise<ProviderBatchResult> {
+  const nativePageSize = positiveInteger(capabilities.nativePageSize || capabilities.maxLimit, 20);
+  return async (request: CatalogFetchBatch): Promise<ProviderBatchResult> => {
+    const resume = request.resumeState.kind === 'page-index'
+      ? request.resumeState
+      : { kind: 'page-index' as const, page: request.providerPage || 1, index: request.pageOffset || 0 };
+    const rawResult: any = await fetchPage(resume.page);
+    const items = Array.isArray(rawResult) ? rawResult : (rawResult?.metas || rawResult?.items || []);
+    const info = (items as any)._providerPageInfo || rawResult?._providerPageInfo || rawResult || {};
+    const allEntries: ReconstructedCatalogEntry[] = Array.isArray(info.entries)
+      ? info.entries
+      : items.map((meta: any, index: number) => ({
+          meta,
+          sourcePosition: { kind: 'page-index', page: resume.page, index },
+          resumeAfter: index + 1 >= nativePageSize
+            ? { kind: 'page-index', page: resume.page + 1, index: 0 }
+            : { kind: 'page-index', page: resume.page, index: index + 1 },
+        }));
+    const entries = allEntries.filter(entry => {
+      return entry.sourcePosition.kind !== 'page-index'
+        || entry.sourcePosition.page > resume.page
+        || (entry.sourcePosition.page === resume.page && entry.sourcePosition.index >= resume.index);
+    });
+    const rawCount = Math.max(0, Number(info.rawCount ?? items.length) - resume.index);
+    const resumeAfterBatch = isProviderResumeState(info.resumeAfterBatch)
+      ? info.resumeAfterBatch
+      : { kind: 'page-index' as const, page: resume.page + 1, index: 0 };
+    const exhaustion: CatalogExhaustion = info.exhaustion || 'unknown';
+    return { entries, rawCount, resumeAfterBatch, exhaustion };
   };
+}
+
+function batchSizeFor(
+  remainingMetas: number,
+  canonicalPageSize: number,
+  capabilities: CatalogProviderCapabilities
+): number {
+  if (!capabilities.supportsVariableLimit || capabilities.cursorBased) {
+    return positiveInteger(capabilities.nativePageSize || capabilities.maxLimit, canonicalPageSize);
+  }
+  const maximum = positiveInteger(capabilities.maxLimit, canonicalPageSize);
+  const aligned = Math.ceil(Math.max(1, remainingMetas) / canonicalPageSize) * canonicalPageSize;
+  return Math.max(1, Math.min(maximum, aligned));
+}
+
+async function trustedAnchor(options: {
+  startPage: number;
+  initialResumeState: ProviderResumeState;
+  loadPage: (page: number) => Promise<CanonicalCatalogPage | null>;
+  dedupeKey: (meta: any) => string | null | undefined;
+}): Promise<{ page: number; resume: ProviderResumeState; seen: Set<string> }> {
+  if (options.startPage <= 1) return { page: 0, resume: options.initialResumeState, seen: new Set() };
+  let anchorPage = 0;
+  let anchor: CanonicalCatalogPage | null = null;
+  for (let page = options.startPage - 1; page >= 1; page -= 1) {
+    const candidate = await options.loadPage(page);
+    if (candidate) {
+      anchorPage = page;
+      anchor = candidate;
+      break;
+    }
+  }
+  if (!anchor) return { page: 0, resume: options.initialResumeState, seen: new Set() };
+
+  const seen = new Set<string>();
+  for (let page = 1; page <= anchorPage; page += 1) {
+    const prior = await options.loadPage(page);
+    if (!prior) return { page: 0, resume: options.initialResumeState, seen: new Set() };
+    for (const meta of prior.metas) {
+      const key = options.dedupeKey(meta);
+      if (key) seen.add(key);
+    }
+  }
+  return { page: anchorPage, resume: anchor._canonical.sourceNext, seen };
 }
 
 export async function hydrateCanonicalPageWindow(options: {
   window: CanonicalPageWindow;
-  capabilities: CatalogProviderCapabilities;
+  adapter?: CatalogSourceAdapter;
+  capabilities?: CatalogProviderCapabilities;
+  initialResumeState?: ProviderResumeState;
   readPage: (page: number) => Promise<CanonicalCatalogPage | null>;
   writePage: (page: number, value: CanonicalCatalogPage) => Promise<CanonicalCatalogPage | void>;
-  fetchBatch: (batch: CatalogFetchBatch) => Promise<CatalogBatchResult>;
-  processItems?: (items: any[]) => Promise<any[]> | any[];
-  dedupeKey?: (item: any) => string | null | undefined;
+  writePages?: (pages: Map<number, CanonicalCatalogPage>) => Promise<Map<number, CanonicalCatalogPage> | void>;
+  fetchBatch?: (request: CatalogFetchBatch) => Promise<ProviderBatchResult>;
+  readTerminal?: () => Promise<CanonicalTerminalState | null>;
+  writeTerminal?: (terminal: CanonicalTerminalState) => Promise<void>;
+  dedupeKey?: (meta: any) => string | null | undefined;
+  acceptEntry?: (entry: ReconstructedCatalogEntry) => Promise<boolean> | boolean;
   maxBatches?: number;
 }): Promise<{
   pages: Map<number, CanonicalCatalogPage>;
   fetchedBatches: CatalogFetchBatch[];
+  writtenPages: number[];
   exhausted: boolean;
+  terminal: CanonicalTerminalState | null;
 }> {
-  const { window, capabilities, readPage, writePage, fetchBatch } = options;
-  const pages = new Map<number, CanonicalCatalogPage>();
-  const fetchedBatches: CatalogFetchBatch[] = [];
-  let exhausted = false;
+  const { window } = options;
+  const capabilities = options.adapter?.capabilities || options.capabilities;
+  const fetchBatch = options.adapter?.fetchBatch || options.fetchBatch;
+  const initialResumeState = options.adapter?.initialResumeState || options.initialResumeState || { kind: 'offset' as const, offset: 0 };
+  if (!capabilities || !fetchBatch) throw new Error('Catalog hydration requires a source adapter');
 
-  await Promise.all(window.pages.map(async page => {
-    const cached = await readPage(page);
-    if (cached) pages.set(page, cached);
-  }));
+  const dedupeKey = options.dedupeKey || ((meta: any) => meta?.id || null);
+  const pages = new Map<number, CanonicalCatalogPage>();
+  const loaded = new Map<number, CanonicalCatalogPage | null>();
+  const fetchedBatches: CatalogFetchBatch[] = [];
+  const writtenPages: number[] = [];
+  let terminal = options.readTerminal ? await options.readTerminal() : null;
+  if (terminal?.schema !== CATALOG_CANONICAL_PAGE_SCHEMA || !isProviderResumeState(terminal.sourceEnd)) terminal = null;
+
+  const loadPage = async (page: number): Promise<CanonicalCatalogPage | null> => {
+    if (loaded.has(page)) return loaded.get(page) || null;
+    const value = await options.readPage(page);
+    const valid = isCanonicalV4Page(value, page) ? value : null;
+    loaded.set(page, valid);
+    if (valid) pages.set(page, valid);
+    return valid;
+  };
+
+  await Promise.all(window.pages.map(loadPage));
+  if (terminal && terminal.lastCanonicalPage < window.startPage) {
+    return { pages, fetchedBatches, writtenPages, exhausted: true, terminal };
+  }
 
   const ranges = planMissingPageRanges(window.pages, pages.keys(), window.canonicalPageSize);
-  for (const originalRange of ranges) {
-    let range = { ...originalRange };
-    if (range.startPage > 1) {
-      const previous = pages.get(range.startPage - 1) || await readPage(range.startPage - 1);
-      const cursorOffset = previous?._canonical?.sourceNextOffset;
-      if (Number.isInteger(cursorOffset) && cursorOffset! >= 0) {
-        range.offset = cursorOffset!;
-      }
-    }
-
-    const targetCount = originalRange.limit;
-    const collected: any[] = [];
-    const seen = new Set<string>();
-    let nextSourceOffset = range.offset;
-    let rawCount = 0;
-    let queue = planProviderFetchBatches([range], capabilities, window.canonicalPageSize);
+  for (const range of ranges) {
+    if (terminal && range.startPage > terminal.lastCanonicalPage) break;
+    const anchor = await trustedAnchor({ startPage: range.startPage, initialResumeState, loadPage, dedupeKey });
+    let currentPage = anchor.page + 1;
+    const targetEndPage = terminal
+      ? Math.min(range.endPage, terminal.lastCanonicalPage)
+      : range.endPage;
+    let currentResume = anchor.resume;
+    const seen = anchor.seen;
+    const staged = new Map<number, CanonicalCatalogPage>();
+    let carry: {
+      entries: ReconstructedCatalogEntry[];
+      index: number;
+      resumeAfterBatch: ProviderResumeState;
+      exhaustion: CatalogExhaustion;
+    } | null = null;
+    let terminalReached = false;
     let batchesRead = 0;
     const maxBatches = options.maxBatches ?? 100;
 
-    while (collected.length < targetCount && !exhausted && batchesRead < maxBatches) {
-      if (!queue.length) {
-        const missing = targetCount - collected.length;
-        const alignedMissing = Math.ceil(missing / window.canonicalPageSize) * window.canonicalPageSize;
-        queue = planProviderFetchBatches([{
-          startPage: originalRange.startPage,
-          endPage: originalRange.endPage,
-          offset: nextSourceOffset,
-          limit: alignedMissing,
-        }], capabilities, window.canonicalPageSize);
+    while (currentPage <= targetEndPage && !terminalReached) {
+      if (terminal && resumeStatesEqual(currentResume, terminal.sourceEnd)) {
+        terminalReached = true;
+        break;
+      }
+      const sourceStart = currentResume;
+      const accepted: ReconstructedCatalogEntry[] = [];
+
+      while (accepted.length < window.canonicalPageSize && !terminalReached) {
+        if (carry && carry.index < carry.entries.length) {
+          const entry = carry.entries[carry.index++];
+          if (!isProviderResumeState(entry.sourcePosition) || !isProviderResumeState(entry.resumeAfter)) {
+            throw new Error('Provider returned an entry without a valid source resume state');
+          }
+          currentResume = entry.resumeAfter;
+          const acceptedByFilter = options.acceptEntry ? await options.acceptEntry(entry) : true;
+          const key = dedupeKey(entry.meta);
+          if (!acceptedByFilter || (key && seen.has(key))) continue;
+          if (key) seen.add(key);
+          accepted.push(entry);
+          continue;
+        }
+
+        if (carry) {
+          const before = currentResume;
+          const hadEntries = carry.entries.length > 0;
+          currentResume = carry.resumeAfterBatch;
+          const state = carry.exhaustion;
+          carry = null;
+          if (state === 'confirmed' || (terminal && resumeStatesEqual(currentResume, terminal.sourceEnd))) {
+            terminalReached = true;
+            break;
+          }
+          if (!hadEntries && resumeStatesEqual(before, currentResume)) {
+            throw new CatalogProviderNoProgressError(`Provider returned no progress at ${resumeStateKey(currentResume)}`);
+          }
+          continue;
+        }
+
+        if (batchesRead >= maxBatches) {
+          throw new CatalogProviderNoProgressError(`Provider did not fill canonical page ${currentPage} within ${maxBatches} batches`);
+        }
+        const remaining = ((targetEndPage - currentPage) * window.canonicalPageSize)
+          + (window.canonicalPageSize - accepted.length);
+        const requestedRawCount = batchSizeFor(remaining, window.canonicalPageSize, capabilities);
+        const request = requestForResume(currentResume, requestedRawCount, capabilities);
+        const result = await fetchBatch(request);
+        fetchedBatches.push(request);
+        batchesRead += 1;
+        if (!result || !Array.isArray(result.entries) || !isProviderResumeState(result.resumeAfterBatch)) {
+          throw new Error('Provider returned an invalid batch result');
+        }
+        if (!['confirmed', 'not-exhausted', 'unknown'].includes(result.exhaustion)) {
+          throw new Error('Provider returned an invalid exhaustion state');
+        }
+        if (!result.entries.length && result.exhaustion !== 'confirmed'
+          && resumeStatesEqual(currentResume, result.resumeAfterBatch)) {
+          throw new CatalogProviderNoProgressError(`Provider returned an empty ${result.exhaustion} batch without progress`);
+        }
+        carry = {
+          entries: result.entries,
+          index: 0,
+          resumeAfterBatch: result.resumeAfterBatch,
+          exhaustion: result.exhaustion,
+        };
       }
 
-      const batch = queue.shift();
-      if (!batch) break;
-      const result = await fetchBatch(batch);
-      fetchedBatches.push(batch);
-      batchesRead += 1;
-
-      const rawItems = Array.isArray(result.items) ? result.items : [];
-      const processed = options.processItems ? await options.processItems(rawItems) : rawItems;
-      const processedItems = processed || [];
-      let acceptedFromBatch = 0;
-      for (const item of processedItems) {
-        const key = options.dedupeKey?.(item);
-        if (key && seen.has(key)) continue;
-        if (key) seen.add(key);
-        collected.push(item);
-        acceptedFromBatch += 1;
-        if (collected.length >= targetCount) break;
+      if (accepted.length === window.canonicalPageSize && carry
+        && carry.index >= carry.entries.length && carry.exhaustion === 'confirmed') {
+        currentResume = carry.resumeAfterBatch;
+        carry = null;
+        terminalReached = true;
       }
 
-      const fetchedRawCount = Math.max(0, result.rawCount ?? rawItems.length);
-      rawCount += fetchedRawCount;
-      const canResumeInsideBatch = collected.length >= targetCount
-        && acceptedFromBatch < processedItems.length
-        && processedItems.length === fetchedRawCount;
-      const proposedNextOffset = canResumeInsideBatch
-        ? batch.offset + acceptedFromBatch
-        : (result.nextOffset ?? (batch.offset + fetchedRawCount));
-      nextSourceOffset = proposedNextOffset > nextSourceOffset
-        ? proposedNextOffset
-        : batch.offset + batch.limit;
-      if (nextSourceOffset !== batch.offset + batch.limit) {
-        queue = [];
+      if (accepted.length === window.canonicalPageSize || (terminalReached && accepted.length > 0)) {
+        staged.set(currentPage, {
+          metas: accepted.map(entry => entry.meta),
+          _canonical: {
+            schema: CATALOG_CANONICAL_PAGE_SCHEMA,
+            page: currentPage,
+            sourceStart,
+            sourceNext: currentResume,
+            exhausted: terminalReached,
+            entryResumes: accepted.map(entry => entry.resumeAfter),
+          },
+        });
+        currentPage += 1;
+      } else if (terminalReached) {
+        break;
+      } else {
+        throw new CatalogProviderNoProgressError(`Provider could not complete canonical page ${currentPage}`);
       }
-      exhausted = result.exhausted;
-
-      if (!fetchedRawCount && !rawItems.length && !exhausted) break;
     }
 
-    const split = splitIntoCanonicalPages(
-      collected.slice(0, targetCount),
-      originalRange.startPage,
-      window.canonicalPageSize,
-      exhausted,
-      range.offset,
-      nextSourceOffset,
-      rawCount
-    );
+    const writeResult = options.writePages
+      ? await options.writePages(staged)
+      : await writeCanonicalPages(staged, options.writePage);
+    const storedPages = writeResult || staged;
+    for (const [page, value] of storedPages) {
+      pages.set(page, value);
+      loaded.set(page, value);
+      writtenPages.push(page);
+    }
 
-    for (const [page, value] of split) {
-      const written = await writePage(page, value);
-      pages.set(page, written || value);
+    if (terminalReached) {
+      const lastCanonicalPage = staged.size
+        ? Math.max(...staged.keys())
+        : Math.max(0, currentPage - 1);
+      terminal = {
+        schema: CATALOG_CANONICAL_PAGE_SCHEMA,
+        sourceEnd: currentResume,
+        lastCanonicalPage,
+      };
+      if (options.writeTerminal) await options.writeTerminal(terminal);
+      break;
     }
   }
 
-  return { pages, fetchedBatches, exhausted };
+  return { pages, fetchedBatches, writtenPages, exhausted: !!terminal, terminal };
+}
+
+export async function resumeStateForCanonicalPosition(
+  page: number,
+  offset: number,
+  readPage: (page: number) => Promise<CanonicalCatalogPage | null>
+): Promise<ProviderResumeState | undefined> {
+  const current = await readPage(page);
+  if (current && isCanonicalV4Page(current, page)) {
+    if (offset <= 0) return current._canonical.sourceStart;
+    return current._canonical.entryResumes[offset - 1] || current._canonical.sourceNext;
+  }
+  if (offset === 0 && page > 1) {
+    const previous = await readPage(page - 1);
+    if (previous && isCanonicalV4Page(previous, page - 1)) return previous._canonical.sourceNext;
+  }
+  return undefined;
 }

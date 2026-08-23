@@ -3,6 +3,7 @@ import { resolveAllIds } from "../lib/id-resolver.js";
 const buildInfo = require('../lib/buildInfo');
 import { getMeta } from "../lib/getMeta.js";
 import { mapWithLimit } from "./concurrency.js";
+import type { CatalogExhaustion, ReconstructedCatalogEntry } from "../lib/catalogFetchPlanner.js";
 import { cacheWrapMetaSmart, cacheWrapMDBListGenres, cacheWrapGlobal } from "../lib/getCache.js";
 import { UserConfig } from "../types/index.js";
 const consola = require('consola');
@@ -307,7 +308,7 @@ async function makeRateLimitedRequest<T>(
   throw new Error(`[${context}] All ${retries} attempts failed.`);
 }
 
-async function fetchMDBListItems(listId: string, apiKey: string, language: string, page: number, sort?: string, order?: string, genre?: string, unified?: boolean, catalogType?: string, cacheTTL?: number, filterScoreMin?: number, filterScoreMax?: number, mediaTypeFilter?: string, pageSizeOverride?: number, offsetOverride?: number, bypassCache: boolean = false): Promise<{items: any[], totalItems?: number, hasMore?: boolean, totalPages?: number}> {
+async function fetchMDBListItems(listId: string, apiKey: string, language: string, page: number, sort?: string, order?: string, genre?: string, unified?: boolean, catalogType?: string, cacheTTL?: number, filterScoreMin?: number, filterScoreMax?: number, mediaTypeFilter?: string, pageSizeOverride?: number, offsetOverride?: number, bypassCache: boolean = false): Promise<{items: any[], totalItems?: number, hasMore?: boolean, totalPages?: number, exhaustion: CatalogExhaustion}> {
   const pageSize = Math.min(100, Math.max(1, pageSizeOverride || parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20));
   const offset = Number.isInteger(offsetOverride) && offsetOverride! >= 0
     ? offsetOverride!
@@ -318,7 +319,7 @@ async function fetchMDBListItems(listId: string, apiKey: string, language: strin
     : 'shared';
 
   const ttlSegment = cacheTTL !== undefined ? `:ttl:${cacheTTL}` : '';
-  const cacheKey = `mdblist-api:items:v3:${keyScope}:${listId}:offset:${offset}:limit:${pageSize}:${sort || ''}:${order || ''}:${genre || ''}:${unified !== false}:${catalogType || ''}:${filterScoreMin ?? ''}:${filterScoreMax ?? ''}:${mediaTypeFilter || ''}${ttlSegment}`;
+  const cacheKey = `mdblist-api:items:v4:${keyScope}:${listId}:offset:${offset}:limit:${pageSize}:${sort || ''}:${order || ''}:${genre || ''}:${unified !== false}:${catalogType || ''}:${filterScoreMin ?? ''}:${filterScoreMax ?? ''}:${mediaTypeFilter || ''}${ttlSegment}`;
 
   const ttl = cacheTTL !== undefined ? cacheTTL : parseInt(process.env.CATALOG_TTL || String(1 * 24 * 60 * 60), 10);
 
@@ -365,7 +366,8 @@ async function fetchMDBListItems(listId: string, apiKey: string, language: strin
       
       // Extract pagination metadata from headers
       let totalItems = response.headers?.['x-total-items'] ? parseInt(response.headers['x-total-items']) : undefined;
-      const hasMore = response.headers?.['x-has-more'] === 'true';
+      const hasMoreHeader = response.headers?.['x-has-more'];
+      const hasMore = hasMoreHeader === undefined ? undefined : String(hasMoreHeader).toLowerCase() === 'true';
       
       // For watchlist, we can only rely on X-Has-More header
       let totalPages: number | undefined;
@@ -413,8 +415,9 @@ async function fetchMDBListItems(listId: string, apiKey: string, language: strin
           return { 
             items: [], 
             totalItems, 
-            hasMore: false, 
-            totalPages 
+            hasMore: false,
+            totalPages,
+            exhaustion: 'confirmed' as CatalogExhaustion,
           };
         }
         
@@ -442,13 +445,14 @@ async function fetchMDBListItems(listId: string, apiKey: string, language: strin
         items,
         totalItems,
         hasMore,
-        totalPages
+        totalPages,
+        exhaustion: resolveMDBListExhaustion(hasMoreHeader, totalItems, offset, items.length),
       };
     };
     return bypassCache ? await fetchItems() : await cacheWrapGlobal(cacheKey, fetchItems, ttl, { upstream: true });
   } catch (err: any) {
     logger.error(`Error retrieving items for list ${listId}, page ${page}:`, err.message);
-    return { items: [] };
+    throw err;
   }
 }
 
@@ -631,6 +635,19 @@ const MDBLIST_API_HOST = 'api.mdblist.com';
 const MDBLIST_BY_NAME_ITEMS_PATH_PATTERN = /^(\/lists\/[^/]+\/[^/]+\/items)(?:\/(?:movie|show))?\/?$/;
 const MDBLIST_EXTERNAL_ITEMS_PATH_PATTERN = /^\/external\/lists\/[^/]+\/items\/?$/;
 
+function resolveMDBListExhaustion(
+  hasMoreHeader: unknown,
+  totalItems: number | undefined,
+  offset: number,
+  rawCount: number
+): CatalogExhaustion {
+  if (hasMoreHeader !== undefined && hasMoreHeader !== null) {
+    return String(hasMoreHeader).toLowerCase() === 'true' ? 'not-exhausted' : 'confirmed';
+  }
+  if (Number.isInteger(totalItems) && offset + rawCount >= totalItems!) return 'confirmed';
+  return 'unknown';
+}
+
 function parseMdblistApiUrl(sourceUrl: string): URL | null {
   try {
     const parsed = new URL(sourceUrl);
@@ -691,7 +708,7 @@ async function fetchMDBListExternalItems(
   pageSizeOverride?: number,
   offsetOverride?: number,
   bypassCache: boolean = false
-): Promise<{items: any[], totalItems?: number, hasMore?: boolean, totalPages?: number}> {
+): Promise<{items: any[], totalItems?: number, hasMore?: boolean, totalPages?: number, exhaustion: CatalogExhaustion}> {
   const pageSize = Math.min(100, Math.max(1, pageSizeOverride || parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20));
   const offset = Number.isInteger(offsetOverride) && offsetOverride! >= 0
     ? offsetOverride!
@@ -713,7 +730,7 @@ async function fetchMDBListExternalItems(
   const urlBase = normalizedUrl.toString();
 
   const ttlSegment = cacheTTL !== undefined ? `:ttl:${cacheTTL}` : '';
-  const cacheKey = `mdblist-api:external:v3:shared:${urlBase}:offset:${offset}:limit:${pageSize}:${sort || ''}:${order || ''}:${genre || ''}:${catalogType || ''}:${unified !== false}:${filterScoreMin ?? ''}:${filterScoreMax ?? ''}${ttlSegment}`;
+  const cacheKey = `mdblist-api:external:v4:shared:${urlBase}:offset:${offset}:limit:${pageSize}:${sort || ''}:${order || ''}:${genre || ''}:${catalogType || ''}:${unified !== false}:${filterScoreMin ?? ''}:${filterScoreMax ?? ''}${ttlSegment}`;
 
   const ttl = cacheTTL !== undefined ? cacheTTL : parseInt(process.env.CATALOG_TTL || String(1 * 24 * 60 * 60), 10);
 
@@ -752,7 +769,8 @@ async function fetchMDBListExternalItems(
           `MDBList fetchMDBListExternalItems (url: ${sanitizeUrlForLogging(effectiveUrl)}, page: ${page})`
       );
 
-      const hasMore = response.headers?.['x-has-more'] === 'true';
+      const hasMoreHeader = response.headers?.['x-has-more'];
+      const hasMore = hasMoreHeader === undefined ? undefined : String(hasMoreHeader).toLowerCase() === 'true';
 
       let items: any[];
 
@@ -781,69 +799,79 @@ async function fetchMDBListExternalItems(
         ];
       }
 
-      return { items, hasMore };
+      return {
+        items,
+        hasMore,
+        exhaustion: resolveMDBListExhaustion(hasMoreHeader, undefined, offset, items.length),
+      };
     };
     return bypassCache ? await fetchItems() : await cacheWrapGlobal(cacheKey, fetchItems, ttl, { upstream: true });
   } catch (err: any) {
       logger.error(`Error retrieving items from URL ${sanitizeUrlForLogging(effectiveUrl)}, page ${page}:`, err.message);
-    return { items: [] };
+    throw err;
   }
 }
 
-async function parseMDBListItems(items: any[], type: string, language: string, config: UserConfig, includeVideos: boolean = false): Promise<any[]> {
-  let filteredItems = items;
-  //console.log(`[MDBList] Filtered items: ${JSON.stringify(filteredItems)}`);
-
-  //const batchMediaInfo = await fetchMDBListBatchMediaInfo('tmdb', targetMediaType, filteredItems.map(item => item.id), config.apiKeys?.mdblist || '');
-  //console.log(`[MDBList] Batch media info: ${JSON.stringify(batchMediaInfo)}`);
-  
-  // Normalize IDs, falling back to imdb_id or tvdb_id when possible
-  const normalizedItems = filteredItems
-  .filter((item: any) => item.mediatype === 'movie' || item.mediatype === 'show')
-  .map((item: any) => {
-    if (!item.id || item.id === null || item.id === undefined) {
-      // Prefer tmdb_id for catalog endpoint items (used as tmdb:{id} downstream)
-      if (item.tmdb_id) {
-        return { ...item, id: item.tmdb_id };
+async function reconstructMDBListEntries(
+  items: any[],
+  type: string,
+  language: string,
+  config: UserConfig,
+  includeVideos: boolean = false,
+  sourceOffset: number = 0
+): Promise<ReconstructedCatalogEntry[]> {
+  const normalizedItems = items
+    .map((item: any, rawIndex: number) => ({ item, rawIndex }))
+    .filter(({ item }: any) => item.mediatype === 'movie' || item.mediatype === 'show')
+    .map(({ item, rawIndex }: any) => {
+      if (!item.id) {
+        if (item.tmdb_id) return { item: { ...item, id: item.tmdb_id }, rawIndex };
+        const imdbId = item.imdb_id && !item.imdb_id.startsWith('tr') ? item.imdb_id : null;
+        const fallbackId = imdbId || item.tvdb_id;
+        if (fallbackId) {
+          return {
+            item: { ...item, imdb_id: imdbId, id: typeof fallbackId === 'string' ? fallbackId : String(fallbackId) },
+            rawIndex,
+          };
+        }
       }
-      if(item.imdb_id && item.imdb_id.startsWith('tr')) item.imdb_id = null;
-      const fallbackId = item.imdb_id || item.tvdb_id;
-      if (fallbackId) {
-        const resolvedId = typeof fallbackId === 'string' ? fallbackId : String(fallbackId);
-        return { ...item, id: resolvedId };
-      }
-    }
-    return item;
-  });
+      return { item, rawIndex };
+    });
 
-  const validItems = normalizedItems.filter((item: any) => {
-    if (!item.id || item.id === null || item.id === undefined) {
+  const validItems = normalizedItems.filter(({ item }: any) => {
+    if (!item.id) {
       logger.warn(`Skipping MDBList item with invalid ID: ${JSON.stringify(item)}`);
       return false;
     }
     return true;
   });
- 
-  const metas = await mapWithLimit(validItems, async (item: any) => {
-      try {
-        let stremioId = `tmdb:${item.id}`;
-        const mdblistType = item.mediatype === 'movie' ? 'movie' : 'series';
 
-        const result = await cacheWrapMetaSmart(config.userUUID || '', stremioId, async () => {
-          return await getMeta(mdblistType, language, stremioId, config, config.userUUID, includeVideos);
-        }, undefined, {enableErrorCaching: true, maxRetries: 2, config}, mdblistType as any, includeVideos);
+  const entries = await mapWithLimit(validItems, async ({ item, rawIndex }: any) => {
+    try {
+      const stremioId = `tmdb:${item.id}`;
+      const mdblistType = item.mediatype === 'movie' ? 'movie' : 'series';
+      const result = await cacheWrapMetaSmart(config.userUUID || '', stremioId, async () => {
+        return getMeta(mdblistType, language, stremioId, config, config.userUUID, includeVideos);
+      }, undefined, { enableErrorCaching: true, maxRetries: 2, config }, mdblistType as any, includeVideos);
 
-        if (result && result.meta) {
-          return result.meta;
-        }
-        return null;
-      } catch (error: any) {
-        logger.error(`Error getting meta for item ${item.id}:`, error.message);
-        return null;
-      }
-    });
+      if (!result?.meta) return null;
+      return {
+        meta: result.meta,
+        sourcePosition: { kind: 'offset', offset: sourceOffset + rawIndex },
+        resumeAfter: { kind: 'offset', offset: sourceOffset + rawIndex + 1 },
+      } as ReconstructedCatalogEntry;
+    } catch (error: any) {
+      logger.error(`Error getting meta for item ${item.id}:`, error.message);
+      return null;
+    }
+  });
 
-  return metas.filter(Boolean);
+  return entries.filter(Boolean) as ReconstructedCatalogEntry[];
+}
+
+async function parseMDBListItems(items: any[], type: string, language: string, config: UserConfig, includeVideos: boolean = false): Promise<any[]> {
+  const entries = await reconstructMDBListEntries(items, type, language, config, includeVideos);
+  return entries.map(entry => entry.meta);
 }
 
 // Global genre mapping cache (title -> slug)
@@ -1705,8 +1733,7 @@ async function fetchMDBListCatalog(
         }
 
         if (!cursor) {
-          logger.warn(`[MDBList Catalog] No cursor found for page ${page} (paramsHash: ${paramsHash}). Returning empty.`);
-          return { items: [], hasMore: false };
+          throw new Error(`[MDBList Catalog] Missing resume cursor for page ${page} (paramsHash: ${paramsHash})`);
         }
       }
 
@@ -1751,7 +1778,7 @@ async function fetchMDBListCatalog(
       return { items, hasMore };
     } catch (err: any) {
       logger.error(`[MDBList Catalog] Error fetching ${mediaType} catalog page ${page}: ${err.message}`);
-      return { items: [], hasMore: false };
+      throw err;
     }
   }, ttl, { upstream: true });
 }
@@ -1765,6 +1792,7 @@ export {
   fetchMDBListBatchMediaInfo,
   getGenresFromMDBList,
   parseMDBListItems,
+  reconstructMDBListEntries,
   getMediaRatingFromMDBList,
   getRatingsFromMDBList,
   fetchMDBListGenres,

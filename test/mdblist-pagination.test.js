@@ -35,6 +35,7 @@ httpClient.httpGet = async (url) => {
   requestedUrls.push(new URL(url));
   const response = httpResponses.shift();
   assert.ok(response, `Unexpected HTTP request: ${url}`);
+  if (response instanceof Error) throw response;
   return response;
 };
 
@@ -130,6 +131,8 @@ test('uses typed URLs, limit, and offset in external MDBList HTTP requests and c
   assert.equal(requestedUrls[1].searchParams.get('offset'), '20');
   assert.deepEqual(movieResult.items, [{ id: 1, mediatype: 'movie' }]);
   assert.deepEqual(seriesResult.items, [{ id: 2, mediatype: 'show' }]);
+  assert.equal(movieResult.exhaustion, 'unknown');
+  assert.equal(seriesResult.exhaustion, 'unknown');
   assert.ok(redisSetKeys.some((key) => key.includes('/items/movie')));
   assert.ok(redisSetKeys.some((key) => key.includes('/items/show')));
 });
@@ -232,7 +235,7 @@ test('separates movie and series cursors for the same MDBList source', async () 
   });
 });
 
-test('uses the legacy page once on cursor mismatch and clears a cursor at skip zero', async () => {
+test('uses the legacy page once on cursor mismatch and does not clear cursor history at skip zero', async () => {
   const key = cursorKey('mismatch-user', 'mdblist.nobnobz.netflix.movie', 'movie', undefined);
   await writeCursor(key, { served: 7, upstreamPage: 2, pageOffset: 0 });
 
@@ -260,7 +263,32 @@ test('uses the legacy page once on cursor mismatch and clears a cursor at skip z
     startOffset: 0,
     matched: true,
   });
-  assert.equal(await readCursor(key), null);
+  assert.deepEqual(await readCursor(key), { served: 7, upstreamPage: 2, pageOffset: 0 });
+});
+
+test('cursor v4 separates parallel clients by their actually served skip', async () => {
+  const query = 'same-query-signature';
+  const clientA = cursorKey('parallel-user', 'mdblist.demo', 'movie', query, 100);
+  const clientB = cursorKey('parallel-user', 'mdblist.demo', 'movie', query, 20);
+  assert.notEqual(clientA, clientB);
+
+  await writeCursor(clientA, {
+    served: 100,
+    upstreamPage: 6,
+    pageOffset: 0,
+    responseLimit: 100,
+    sourceResume: { kind: 'offset', offset: 100 },
+  });
+  await writeCursor(clientB, {
+    served: 20,
+    upstreamPage: 2,
+    pageOffset: 0,
+    responseLimit: 20,
+    sourceResume: { kind: 'offset', offset: 20 },
+  });
+
+  assert.equal((await readCursor(clientA)).sourceResume.offset, 100);
+  assert.equal((await readCursor(clientB)).sourceResume.offset, 20);
 });
 
 test('retains multi-page fill behavior for filter-active catalogs', async () => {

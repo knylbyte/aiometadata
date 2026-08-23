@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Catalog pagination now uses `canonical-v4` pages with exact offset/page-index/cursor resume states, `catalog-cursor:v4` history keys, and `canonical-terminal:v4` end markers.
+- Runtime and warmup share `provider-batch:v1` raw batches with in-process single-flight. Provider errors and unknown exhaustion never create terminal or partial canonical pages.
+- MDBList raw item caches move from v3 to v4 because their pagination payload now distinguishes missing `x-has-more` headers from an explicit end. Older catalog, cursor, and MDBList paging keys are not read and expire naturally; unrelated metadata, mapping, genre, poster, TMDB, and TVDB caches remain valid.
+- `META_CONCURRENCY=0` now selects a safe automatic concurrency of 20 instead of unbounded metadata reconstruction.
+
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
 ## [2.13.0](https://github.com/cedya77/aiometadata/compare/v2.12.0...v2.13.0) (2026-08-16)

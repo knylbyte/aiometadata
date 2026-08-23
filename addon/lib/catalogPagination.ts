@@ -1,74 +1,75 @@
-import consola from 'consola';
-import { LRUCache } from 'lru-cache';
-import redis from './redisClient.js';
-import { envInt } from '../utils/envNumber';
-
-const logger = consola.withTag('CatalogPagination');
+import redis from './redisClient';
+import type { CanonicalTerminalState, ProviderResumeState } from './catalogFetchPlanner';
 
 export interface CatalogCursor {
   served: number;
   upstreamPage: number;
-  pageOffset: number;
+  pageOffset?: number;
   responseLimit?: number;
+  canonicalPage?: number;
+  canonicalOffset?: number;
+  sourceResume?: ProviderResumeState;
 }
 
-export function fillMaxPages(): number {
-  return envInt('CATALOG_FILTER_FILL_MAX_PAGES', 5, 1);
-}
+const CURSOR_PREFIX = 'catalog-cursor:v4';
+const TERMINAL_PREFIX = 'canonical-terminal:v4';
 
-function cursorTtlSeconds(): number {
-  return envInt('CATALOG_CURSOR_TTL', 6 * 60 * 60, 60);
+function segment(value: unknown): string {
+  return encodeURIComponent(String(value ?? ''));
 }
-
-const memoryCursors = new LRUCache<string, CatalogCursor>({
-  max: envInt('CATALOG_CURSOR_MEMORY_MAX', 5000, 1),
-  ttl: cursorTtlSeconds() * 1000,
-});
 
 export function cursorKey(
   userUUID: string,
-  cleanId: string,
+  catalogId: string,
   type: string,
-  genre: string | undefined | null
+  querySignature?: string,
+  served: number = 0
 ): string {
-  return `catalog-cursor:v3:${userUUID}:${cleanId}:${type}:${genre || 'all'}`;
+  return `${CURSOR_PREFIX}:${segment(userUUID)}:${segment(catalogId)}:${segment(type)}:${segment(querySignature || 'default')}:served:${Math.max(0, served | 0)}`;
+}
+
+export function terminalKey(userUUID: string, querySignature: string): string {
+  return `${TERMINAL_PREFIX}:${segment(userUUID)}:${segment(querySignature)}`;
 }
 
 export async function readCursor(key: string): Promise<CatalogCursor | null> {
-  if (redis) {
-    try {
-      const raw = await redis.get(key);
-      return raw ? JSON.parse(raw) : null;
-    } catch (error: any) {
-      logger.debug(`Cursor read failed for ${key}: ${error.message}`);
-      return null;
-    }
+  if (!redis) return null;
+  const raw = await redis.get(key);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as CatalogCursor;
+  } catch {
+    await redis.del(key);
+    return null;
   }
-  return memoryCursors.get(key) || null;
 }
 
 export async function writeCursor(key: string, cursor: CatalogCursor): Promise<void> {
-  if (redis) {
-    try {
-      await redis.set(key, JSON.stringify(cursor), 'EX', cursorTtlSeconds());
-    } catch (error: any) {
-      logger.debug(`Cursor write failed for ${key}: ${error.message}`);
-    }
-    return;
-  }
-  memoryCursors.set(key, cursor);
+  if (!redis) return;
+  const ttl = Math.max(60, parseInt(process.env.CATALOG_CURSOR_TTL || '3600', 10) || 3600);
+  await redis.set(key, JSON.stringify(cursor), 'EX', ttl);
 }
 
 export async function clearCursor(key: string): Promise<void> {
-  if (redis) {
-    try {
-      await redis.del(key);
-    } catch (error: any) {
-      logger.debug(`Cursor clear failed for ${key}: ${error.message}`);
-    }
-    return;
+  if (redis) await redis.del(key);
+}
+
+export async function readCatalogTerminal(key: string): Promise<CanonicalTerminalState | null> {
+  if (!redis) return null;
+  const raw = await redis.get(key);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as CanonicalTerminalState;
+  } catch {
+    await redis.del(key);
+    return null;
   }
-  memoryCursors.delete(key);
+}
+
+export async function writeCatalogTerminal(key: string, state: CanonicalTerminalState): Promise<void> {
+  if (!redis) return;
+  const ttl = Math.max(60, parseInt(process.env.CATALOG_TTL || '86400', 10) || 86400);
+  await redis.set(key, JSON.stringify(state), 'EX', ttl);
 }
 
 export async function resolveStartPage(
@@ -77,24 +78,24 @@ export async function resolveStartPage(
   legacyPage: number,
   legacyOffset: number = 0
 ): Promise<{ startPage: number; startOffset: number; matched: boolean }> {
-  if (skip === 0) {
-    await clearCursor(key);
-    return { startPage: 1, startOffset: 0, matched: true };
-  }
-
+  if (skip <= 0) return { startPage: 1, startOffset: 0, matched: true };
   const cursor = await readCursor(key);
   if (cursor && cursor.served === skip) {
-    return { startPage: cursor.upstreamPage, startOffset: cursor.pageOffset || 0, matched: true };
+    return {
+      startPage: Math.max(1, cursor.canonicalPage || cursor.upstreamPage || 1),
+      startOffset: Math.max(0, cursor.canonicalOffset ?? cursor.pageOffset ?? 0),
+      matched: true,
+    };
   }
-  return { startPage: legacyPage, startOffset: legacyOffset, matched: false };
+  return {
+    startPage: Math.max(1, legacyPage || 1),
+    startOffset: Math.max(0, legacyOffset || 0),
+    matched: false,
+  };
 }
 
-export interface FillResult {
-  metas: any[];
-  nextPage: number;
-  nextOffset: number;
-  pagesRead: number;
-  exhausted: boolean;
+export function fillMaxPages(): number {
+  return Math.max(1, parseInt(process.env.CATALOG_FILTER_FILL_MAX_PAGES || '5', 10) || 5);
 }
 
 export async function fillFilteredPage(options: {
@@ -104,46 +105,39 @@ export async function fillFilteredPage(options: {
   sourcePageSize?: number;
   maxPages?: number;
   fetchPage: (page: number) => Promise<any[]>;
-  filter: (metas: any[]) => Promise<any[]>;
-}): Promise<FillResult> {
-  const { startPage, pageSize, fetchPage, filter } = options;
-  const sourcePageSize = options.sourcePageSize ?? pageSize;
-  const maxPages = options.maxPages ?? fillMaxPages();
-
+  filter: (items: any[]) => Promise<any[]> | any[];
+}): Promise<{ metas: any[]; nextPage: number; nextOffset: number; pagesRead: number; exhausted: boolean }> {
+  const pageSize = Math.max(1, options.pageSize);
+  const sourcePageSize = Math.max(1, options.sourcePageSize || pageSize);
+  const maxPages = Math.max(1, options.maxPages || fillMaxPages());
   const metas: any[] = [];
-  let page = startPage;
-  let offset = options.startOffset || 0;
+  let page = Math.max(1, options.startPage);
+  let offset = Math.max(0, options.startOffset || 0);
   let pagesRead = 0;
   let exhausted = false;
 
   while (metas.length < pageSize && pagesRead < maxPages) {
-    const raw = await fetchPage(page);
+    const raw = await options.fetchPage(page);
     pagesRead += 1;
-
     if (!raw || raw.length === 0) {
       exhausted = true;
       offset = 0;
       page += 1;
       break;
     }
-
-    const available = (await filter(raw)).slice(offset);
+    const available = (await options.filter(raw)).slice(offset);
     const taken = available.slice(0, pageSize - metas.length);
     metas.push(...taken);
-
     if (taken.length < available.length) {
       offset += taken.length;
       break;
     }
-
     offset = 0;
     page += 1;
-
     if (raw.length < sourcePageSize) {
       exhausted = true;
       break;
     }
   }
-
   return { metas, nextPage: page, nextOffset: offset, pagesRead, exhausted };
 }

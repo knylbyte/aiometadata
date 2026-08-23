@@ -11,9 +11,10 @@ const addon = express();
 
 const { getCatalog, fetchCatalogBatch } = require("./lib/getCatalog");
 const { applyCatalogFilters, catalogFiltersActive } = require("./utils/catalogFilters");
-const { cursorKey, readCursor, resolveStartPage, writeCursor, fillFilteredPage, fillMaxPages } = require("./lib/catalogPagination");
+const { cursorKey, readCursor, readCatalogTerminal, resolveStartPage, terminalKey, writeCatalogTerminal, writeCursor, fillFilteredPage, fillMaxPages } = require("./lib/catalogPagination");
 const { catalogPageSizeMode, fixedCatalogPageSize, resolveCatalogResponseLimit } = require("./lib/catalogPageSize");
-const { buildCanonicalCatalogCacheArgs, createSequentialPageBatchFetcher, hydrateCanonicalPageWindow, resolveCanonicalPageWindow, resolveCatalogProviderCapabilities } = require("./lib/catalogFetchPlanner");
+const { buildCanonicalCatalogCacheArgs, buildCatalogQuerySignature, hydrateCanonicalPageWindow, resolveCanonicalPageWindow, resumeStateForCanonicalPosition, writeCanonicalPages } = require("./lib/catalogFetchPlanner");
+const { createCatalogSourceAdapter } = require("./lib/catalogSourceAdapter");
 const anilist = require("./lib/anilist");
 const { getSearch } = require("./lib/getSearch");
 const { getManifest, DEFAULT_LANGUAGE } = require("./lib/getManifest");
@@ -4355,16 +4356,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
 
   const skipValue = extraArgs.skip !== undefined ? Math.max(0, parseInt(extraArgs.skip) || 0) : 0;
   const cursorGenre = extraArgs.genre;
-  const pageSizeMode = catalogPageSizeMode();
-  const pageSizeCursorKey = cursorKey(userUUID, cleanId, actualType, cursorGenre);
-  const storedCursor = pageSizeMode === 'request' && skipValue > 0
-    ? await readCursor(pageSizeCursorKey)
-    : null;
-  const responseLimit = resolveCatalogResponseLimit(req, extraArgs, storedCursor);
   const canonicalPageSize = fixedCatalogPageSize();
-  const useOuterPageSizeCursor = pageSizeMode === 'request'
-    || responseLimit !== canonicalPageSize
-    || (skipValue % canonicalPageSize) !== 0;
   const isOffsetBased = cleanId.startsWith('stremthru.') || cleanId.startsWith('custom.') || cleanId.startsWith('merged.');
   const catalogPage = skipValue > 0
     ? Math.floor(skipValue / canonicalPageSize) + 1
@@ -4382,10 +4374,8 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
   const isCursorSensitiveMdblistCatalog =
     cleanId.startsWith('mdblist.') &&
     usesMdblistExternalItemsEndpoint(catalogConfig);
-  const useCursorPagination = filtersActive || isCursorSensitiveMdblistCatalog || useOuterPageSizeCursor;
-
   if (isCursorSensitiveMdblistCatalog) {
-    cacheExtraArgs._mdblistPaging = 'typed-canonical-v3';
+    cacheExtraArgs._mdblistPaging = 'typed-canonical-v4';
   }
 
   if (cleanId.startsWith('simkl.watchlist.') || cleanId.startsWith('simkl.upnext')) {
@@ -4439,6 +4429,32 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
       consola.warn(`[Catalog] MovieLens group tags failed for ${cleanId}: ${e.message}`);
     }
   }
+
+  const querySignature = buildCatalogQuerySignature({
+    catalogId: cleanId,
+    type: actualType,
+    language,
+    canonicalPageSize,
+    args: cacheExtraArgs,
+    catalogConfig,
+    configFingerprint: {
+      sfw: config.sfw,
+      hideWatched: config.hideWatched,
+      filters: config.filters || null,
+    },
+  });
+  const pageSizeMode = catalogPageSizeMode();
+  const pageSizeCursorKey = cursorKey(userUUID, cleanId, actualType, querySignature, skipValue);
+  const storedCursor = skipValue > 0 ? await readCursor(pageSizeCursorKey) : null;
+  const isSearchCatalog = cleanId === 'search' || cleanId === 'gemini.search' || cleanId === 'people_search';
+  const responseLimit = isSearchCatalog
+    ? canonicalPageSize
+    : resolveCatalogResponseLimit(req, extraArgs, storedCursor);
+  const useOuterPageSizeCursor = pageSizeMode === 'request'
+    || responseLimit !== canonicalPageSize
+    || (skipValue % canonicalPageSize) !== 0;
+  const useCursorPagination = filtersActive || isCursorSensitiveMdblistCatalog || useOuterPageSizeCursor;
+  const catalogTerminalKey = terminalKey(userUUID, querySignature);
 
   const cacheOptions = {
     enableErrorCaching: true,
@@ -4556,18 +4572,6 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
           return { metas: searchResult.metas || [] };
         }, searchEngine, cacheOptions);
       }
-      } else if ((cleanId.startsWith('custom.') || cleanId.startsWith('stremthru.')) && !useOuterPageSizeCursor) {
-      const { genre: genreName } = extraArgs;
-      const skipValue = extraArgs.skip !== undefined ? parseInt(extraArgs.skip) : 0;
-      const result = await getCatalog(actualType, language, catalogPage, cleanId, genreName, config, userUUID, false, skipValue);
-      responseData = { metas: result.metas || [] };
-      filtersAlreadyApplied = true;
-      } else if (cleanId.startsWith('merged.') && !useOuterPageSizeCursor) {
-      const { genre: genreName } = extraArgs;
-      const skipValue = extraArgs.skip !== undefined ? parseInt(extraArgs.skip) : 0;
-      const result = await getCatalog(actualType, language, catalogPage, cleanId, genreName, config, userUUID, false, skipValue);
-      responseData = { metas: result.metas || [] };
-      filtersAlreadyApplied = true;
       } else {
       const { genre: genreName, type_filter } = extraArgs;
       const runCatalogPage = async (page, skipOverride) => {
@@ -4633,18 +4637,25 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     };
 
     const keyForPage = (page) => {
-      const pageArgs = buildCanonicalCatalogCacheArgs(cacheExtraArgs, page, canonicalPageSize);
+      const pageArgs = buildCanonicalCatalogCacheArgs(cacheExtraArgs, page, canonicalPageSize, querySignature);
       return `${cleanId}:${actualType}:${stableStringify(pageArgs)}`;
     };
 
-    const capabilities = resolveCatalogProviderCapabilities(cleanId, catalogConfig, canonicalPageSize);
-    const sequentialBatchFetch = createSequentialPageBatchFetcher(capabilities, async (page) => {
-      const pageSkip = isOffsetBased ? (page - 1) * capabilities.fixedPageSize : undefined;
-      return (await runCatalogPage(page, pageSkip))?.metas || [];
-    });
-    const fetchProviderBatch = async (batch) => {
-      if (capabilities.supportsVariableLimit && !capabilities.cursorBased) {
-        const result = await fetchCatalogBatch({
+    const sourceAdapter = createCatalogSourceAdapter({
+      catalogId: cleanId,
+      catalogConfig,
+      canonicalPageSize,
+      querySignature,
+      type: actualType,
+      language,
+      genre: genreName || null,
+      userUUID,
+      credential: cleanId.startsWith('mdblist.')
+        ? (config.apiKeys?.mdblist || process.env.MDBLIST_API_KEY || process.env.BUILT_IN_MDBLIST_API_KEY || '')
+        : undefined,
+      fetchOffsetBatch: async (resumeState, requestedRawCount) => {
+        if (resumeState.kind !== 'offset') throw new Error(`Offset adapter received ${resumeState.kind} resume state`);
+        return fetchCatalogBatch({
           type: actualType,
           language,
           id: cleanId,
@@ -4652,22 +4663,26 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
           config,
           userUUID,
           includeVideos: false,
-          offset: batch.offset,
-          limit: batch.limit,
+          resumeState,
+          requestedRawCount,
         });
-        if (result.supported) return result;
-      }
-      return sequentialBatchFetch(batch);
-    };
+      },
+      fetchPage: async (page, nativePageSize) => {
+        const pageSkip = isOffsetBased ? (page - 1) * nativePageSize : undefined;
+        return (await runCatalogPage(page, pageSkip))?.metas || [];
+      },
+    });
     const readCachedPage = (page) => readCatalogCache(userUUID, keyForPage(page), { config });
     const writeCachedPage = (page, value) =>
       cacheWrapper(userUUID, keyForPage(page), async () => value, cacheOptions);
     const hydrateWindow = async (absoluteSkip, limit) => hydrateCanonicalPageWindow({
       window: resolveCanonicalPageWindow(absoluteSkip, limit, canonicalPageSize),
-      capabilities,
+      adapter: sourceAdapter,
       readPage: readCachedPage,
       writePage: writeCachedPage,
-      fetchBatch: fetchProviderBatch,
+      writePages: pages => writeCanonicalPages(pages, writeCachedPage),
+      readTerminal: () => readCatalogTerminal(catalogTerminalKey),
+      writeTerminal: state => writeCatalogTerminal(catalogTerminalKey, state),
       maxBatches: Math.max(20, fillMaxPages() * 4),
     });
     const getCanonicalPage = async (page) => {
@@ -4678,8 +4693,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     };
 
       if (useCursorPagination) {
-      const key = pageSizeCursorKey;
-      const { startPage, startOffset, matched } = await resolveStartPage(key, skipValue, catalogPage, catalogPageOffset);
+      const { startPage, startOffset, matched } = await resolveStartPage(pageSizeCursorKey, skipValue, catalogPage, catalogPageOffset);
       await hydrateWindow((startPage - 1) * canonicalPageSize + startOffset, responseLimit);
       const seenFilteredIds = new Set();
 
@@ -4705,7 +4719,13 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
 
       responseData = { metas: filled.metas };
       filtersAlreadyApplied = true;
-      pendingCursor = { key, skip: skipValue, page: filled.nextPage, offset: filled.nextOffset, responseLimit };
+      pendingCursor = {
+        skip: skipValue,
+        page: filled.nextPage,
+        offset: filled.nextOffset,
+        responseLimit,
+        sourceResume: await resumeStateForCanonicalPosition(filled.nextPage, filled.nextOffset, getCanonicalPage),
+      };
 
       consola.debug(
         `[Catalog] ${cleanId}: filled ${filled.metas.length}/${responseLimit} from ${filled.pagesRead} canonical page(s) ` +
@@ -4746,10 +4766,14 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     }
 
     if (pendingCursor) {
-      await writeCursor(pendingCursor.key, {
-        served: pendingCursor.skip + (responseData?.metas?.length || 0),
+      const served = pendingCursor.skip + (responseData?.metas?.length || 0);
+      await writeCursor(cursorKey(userUUID, cleanId, actualType, querySignature, served), {
+        served,
         upstreamPage: pendingCursor.page,
         pageOffset: pendingCursor.offset,
+        canonicalPage: pendingCursor.page,
+        canonicalOffset: pendingCursor.offset,
+        sourceResume: pendingCursor.sourceResume,
         responseLimit: pendingCursor.responseLimit,
       });
     }

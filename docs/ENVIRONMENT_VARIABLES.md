@@ -536,7 +536,7 @@ These caps bound the per-process heap used by module-level caches. The defaults 
 ### `CATALOG_PAGE_SIZE_MODE`
 - **Default**: `fixed`
 - **Values**: `fixed`, `request`
-- **Description**: Controls only the maximum number of metas returned to the client. In `fixed` mode every catalog response is capped at `CATALOG_LIST_ITEMS_SIZE`. In `request` mode a valid client limit is used and remembered in the catalog cursor for follow-up requests. Client limits never change internal cache-page geometry.
+- **Description**: Controls only the maximum number of metas returned to the client. In `fixed` mode every catalog response is capped at `CATALOG_LIST_ITEMS_SIZE`. In `request` mode a valid client limit is used and remembered in the catalog cursor for follow-up requests. Client limits never change internal cache-page geometry. Search catalogs retain their provider-specific pagination and therefore always use the fixed canonical response size.
 - **Supported Requests**: `?limit=100` and `?extra=limit%3D100`
 
 ### `CATALOG_LIST_ITEMS_SIZE`
@@ -544,6 +544,8 @@ These caps bound the per-process heap used by module-level caches. The defaults 
 - **Range**: `1` to `100`
 - **Description**: Canonical internal catalog cache-page size. All clients share these pages regardless of requested response limit. In `fixed` mode this is also the client response limit.
 - **Example**: `CATALOG_LIST_ITEMS_SIZE=20`
+
+Canonical pages use the `canonical-v4` namespace and store exact provider resume boundaries. Runtime requests and cache warmup therefore read and write the same pages even when client response limits differ.
 
 ### `CATALOG_REQUEST_LIMIT_FALLBACK`
 - **Default**: `20`
@@ -647,9 +649,14 @@ These caps bound the per-process heap used by module-level caches. The defaults 
 - **Note**: Adjust based on your server capacity and API limits
 
 ### `META_CONCURRENCY`
-- **Default**: Unlimited
-- **Description**: Maximum number of concurrent `getMeta()` calls per catalog request. Each catalog page can trigger 20-50 simultaneous meta fetches; on public instances with many active users, this can spike memory usage. Set to 20-30 to cap peak heap usage while keeping response times fast. Cached items resolve instantly regardless of this limit.
+- **Default**: `0` (safe automatic limit of `20`)
+- **Description**: Maximum number of concurrent `getMeta()` calls per catalog request. Positive values override the automatic limit. `0` no longer creates an unbounded `Promise.all()` batch.
 - **Example**: `META_CONCURRENCY=25`
+
+### `CATALOG_PROVIDER_BATCH_TTL`
+- **Default**: `300`
+- **Description**: TTL in seconds for exact raw provider batches shared by runtime requests and cache warmup. Batch keys include provider, hashed source identity, query signature, resume state, and upstream limit. Provider errors are never cached.
+- **Example**: `CATALOG_PROVIDER_BATCH_TTL=300`
 
 ### `HEAP_LOG_INTERVAL_MIN`
 - **Default**: `0` (disabled)

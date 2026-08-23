@@ -9,6 +9,7 @@ import { fetchLetterboxdList, parseLetterboxdItems, getLetterboxdGenreIdByName }
 import { getFlixPatrolMetas } from "../utils/flixpatrolUtils.js";
 import { fetchResume, parseResumeItems, fetchListItems, parseListItems, fetchPickItems, parsePickItems } from "../utils/publicmetadbUtils.js";
 import { mapWithLimit } from "../utils/concurrency.js";
+import type { ProviderBatchResult, ProviderResumeState } from './catalogFetchPlanner.js';
 const anilist = require('./anilist');
 import * as jikan from "./mal.js"
 import * as Utils from '../utils/parseProps.js';
@@ -156,7 +157,7 @@ async function getCatalog(type: string, language: string, page: number, id: stri
     logger.error(`Error in getCatalog router for id=${id}, type=${type}: ${error.message}`);
     logger.error(`Error at: ${errorLine}`);
     logger.error(`Full stack trace:`, error.stack);
-    return { metas: [] };
+    throw error;
   }
 }
 
@@ -168,30 +169,49 @@ interface CatalogBatchFetchOptions {
   config: UserConfig;
   userUUID: string;
   includeVideos?: boolean;
-  offset: number;
-  limit: number;
+  offset?: number;
+  limit?: number;
+  resumeState?: ProviderResumeState;
+  requestedRawCount?: number;
 }
 
-async function fetchCatalogBatch(options: CatalogBatchFetchOptions): Promise<{
+async function fetchCatalogBatch(options: CatalogBatchFetchOptions): Promise<ProviderBatchResult & {
   supported: boolean;
   items: any[];
-  rawCount: number;
   nextOffset: number;
   exhausted: boolean;
 }> {
-  const { type, language, id, genre, config, includeVideos = false, offset, limit } = options;
+  const { type, language, id, genre, config, includeVideos = false } = options;
+  const offset = options.resumeState?.kind === 'offset'
+    ? options.resumeState.offset
+    : Math.max(0, options.offset || 0);
+  const limit = Math.min(100, Math.max(1, options.requestedRawCount || options.limit || 20));
   if (!id.startsWith('mdblist.') || id.startsWith('mdblist.discover.') || id === 'mdblist.upnext') {
-    return { supported: false, items: [], rawCount: 0, nextOffset: offset, exhausted: false };
+    return {
+      supported: false,
+      items: [],
+      entries: [],
+      rawCount: 0,
+      nextOffset: offset,
+      resumeAfterBatch: { kind: 'offset', offset },
+      exhaustion: 'unknown',
+      exhausted: false,
+    };
   }
 
   const catalogConfig = config.catalogs?.find(c => c.id === id);
   const apiKey = config.apiKeys?.mdblist || process.env.MDBLIST_API_KEY || process.env.BUILT_IN_MDBLIST_API_KEY || '';
-  const { convertGenreToSlug, fetchMDBListExternalItems, fetchMDBListItems } = await import('../utils/mdbList.js');
+  const {
+    convertGenreToSlug,
+    fetchMDBListExternalItems,
+    fetchMDBListItems,
+    reconstructMDBListEntries,
+  } = await import('../utils/mdbList.js');
   const genreSlug = await convertGenreToSlug(genre, apiKey);
   const sort = catalogConfig?.sort === 'default' ? undefined : catalogConfig?.sort;
   const order = catalogConfig?.sort === 'default' ? undefined : catalogConfig?.order;
   const scoreFiltersAllowed = supportsMdblistScoreFilters(catalogConfig);
-  let response: { items: any[]; hasMore?: boolean };
+  let response: { items: any[]; hasMore?: boolean; exhaustion: 'confirmed' | 'not-exhausted' | 'unknown' };
 
   if (usesMdblistExternalItemsEndpoint(catalogConfig)) {
     response = await fetchMDBListExternalItems(
@@ -209,7 +229,7 @@ async function fetchCatalogBatch(options: CatalogBatchFetchOptions): Promise<{
       catalogConfig?.cacheTTL,
       limit,
       offset,
-      true
+      false
     );
   } else {
     let listId: string;
@@ -248,20 +268,31 @@ async function fetchCatalogBatch(options: CatalogBatchFetchOptions): Promise<{
       mediaTypeFilter,
       limit,
       offset,
-      true
+      false
     );
   }
 
   const rawItems = response.items || [];
-  const metas = await parseMDBListItems(rawItems, type, language, config, includeVideos);
+  const entries = await reconstructMDBListEntries(
+    rawItems,
+    type,
+    language,
+    { ...config, userUUID: options.userUUID },
+    includeVideos,
+    offset
+  );
+  const metas = entries.map((entry: any) => entry.meta);
   const rawCount = rawItems.length;
-  const exhausted = rawCount === 0 || (response.hasMore === false && rawCount < limit);
+  const resumeAfterBatch: ProviderResumeState = { kind: 'offset', offset: offset + rawCount };
   return {
     supported: true,
     items: metas,
+    entries,
     rawCount,
     nextOffset: offset + rawCount,
-    exhausted,
+    resumeAfterBatch,
+    exhaustion: response.exhaustion,
+    exhausted: response.exhaustion === 'confirmed',
   };
 }
 
@@ -571,19 +602,18 @@ async function getAniListDiscoverCatalog(
 
     // Handle cached error responses
     if (response && (response as any).error) {
-      logger.warn(`[AniList Discover] Cached error for ${catalogId}: ${(response as any).message}`);
-      return [];
+      throw new Error(`[AniList Discover] ${(response as any).message}`);
     }
 
     if (!response?.items || response.items.length === 0) {
       logger.info(`[AniList Discover] No results for ${catalogId} at page ${page}`);
-      return [];
+      return resolveAniListPageWithProvenance([], type, language, config, userUUID, includeVideos, page, response?.hasMore);
     }
 
     // Resolve AniList media IDs to Stremio meta objects
     // (reuses the existing resolveAniListItemsToMetas function)
-    const metas = await resolveAniListItemsToMetas(
-      response.items, type, language, config, userUUID, includeVideos
+    const metas = await resolveAniListPageWithProvenance(
+      response.items, type, language, config, userUUID, includeVideos, page, response.hasMore
     );
 
     logger.success(`[AniList Discover] Processed ${metas.length} items for ${catalogId} (page ${page})`);
@@ -592,7 +622,7 @@ async function getAniListDiscoverCatalog(
     const errorLine = err.stack?.split('\n')[1]?.trim() || 'unknown';
     logger.error(`[AniList Discover] Error processing catalog ${catalogId}: ${err.message}`);
     logger.error(`Error at: ${errorLine}`);
-    return [];
+    throw err;
   }
 }
 
@@ -2443,6 +2473,42 @@ async function getTraktCatalog(
  * Get AniList catalog items for a user's list
  * Handles 'anilist.*' catalog IDs (e.g., anilist.Watching, anilist.Completed)
  */
+async function resolveAniListPageWithProvenance(
+  items: any[],
+  type: string,
+  language: string,
+  config: UserConfig,
+  userUUID: string,
+  includeVideos: boolean,
+  page: number,
+  hasMore: boolean | undefined
+): Promise<any[]> {
+  const nativePageSize = 50;
+  const resolved = await mapWithLimit(items, async (item: any, sourceIndex: number) => {
+    const metas = await resolveAniListItemsToMetas([item], type, language, config, userUUID, includeVideos);
+    if (!metas[0]) return null;
+    return {
+      meta: metas[0],
+      sourcePosition: { kind: 'page-index', page, index: sourceIndex },
+      resumeAfter: sourceIndex + 1 >= nativePageSize
+        ? { kind: 'page-index', page: page + 1, index: 0 }
+        : { kind: 'page-index', page, index: sourceIndex + 1 },
+    };
+  });
+  const entries = resolved.filter(Boolean);
+  const metas = entries.map((entry: any) => entry.meta);
+  Object.defineProperty(metas, '_providerPageInfo', {
+    value: {
+      entries,
+      rawCount: items.length,
+      resumeAfterBatch: { kind: 'page-index', page: page + 1, index: 0 },
+      exhaustion: hasMore === true ? 'not-exhausted' : hasMore === false ? 'confirmed' : 'unknown',
+    },
+    enumerable: false,
+  });
+  return metas;
+}
+
 async function getAniListCatalog(
   type: string,
   catalogId: string,
@@ -2476,18 +2542,19 @@ async function getAniListCatalog(
       
       // Handle cached error responses
       if (response && (response as any).error) {
-        logger.warn(`[AniList] Cached error for trending: ${(response as any).message}`);
-        return [];
+        throw new Error(`[AniList] ${(response as any).message}`);
       }
       
       logger.debug(`[AniList] Fetched ${response.items.length} trending items, hasMore: ${response.hasMore}`);
       
       if (response.items.length === 0) {
-        return [];
+        return resolveAniListPageWithProvenance([], type, language, config, userUUID, includeVideos, page, response.hasMore);
       }
       
       // Resolve AniList media IDs to Stremio metas
-      const metas = await resolveAniListItemsToMetas(response.items, type, language, config, userUUID, includeVideos);
+      const metas = await resolveAniListPageWithProvenance(
+        response.items, type, language, config, userUUID, includeVideos, page, response.hasMore
+      );
       logger.success(`[AniList] Processed ${metas.length} trending items (page ${page})`);
       return metas;
     }
@@ -2510,7 +2577,7 @@ async function getAniListCatalog(
       return [];
     }
     
-    const pageSize = Math.min(catalogRequestPageSize(), 50);
+    const pageSize = 50;
     
     // Get custom cache TTL and sort option from catalog config if specified
     const customCacheTTL = catalogConfig?.cacheTTL || null;
@@ -2535,8 +2602,7 @@ async function getAniListCatalog(
     
     // Handle cached error responses
     if (response && (response as any).error) {
-      logger.warn(`[AniList] Cached error for list "${listName}": ${(response as any).message}`);
-      return [];
+      throw new Error(`[AniList] ${(response as any).message}`);
     }
     
     logger.debug(`[AniList] Fetched ${response.items.length} items from list "${listName}", hasMore: ${response.hasMore}`);
@@ -2544,11 +2610,13 @@ async function getAniListCatalog(
     // Early exit for empty pages
     if (response.items.length === 0) {
       logger.debug(`[AniList] No items at page ${page} for list "${listName}"`);
-      return [];
+      return resolveAniListPageWithProvenance([], type, language, config, userUUID, includeVideos, page, response.hasMore);
     }
     
     // Resolve AniList media IDs to Stremio metas
-    const metas = await resolveAniListItemsToMetas(response.items, type, language, config, userUUID, includeVideos);
+    const metas = await resolveAniListPageWithProvenance(
+      response.items, type, language, config, userUUID, includeVideos, page, response.hasMore
+    );
     
     logger.success(`[AniList] Processed ${metas.length} items for catalog ${catalogId} (page ${page})`);
     return metas;
@@ -2558,7 +2626,7 @@ async function getAniListCatalog(
     logger.error(`[AniList] Error processing catalog ${catalogId}: ${err.message}`);
     logger.error(`Error at: ${errorLine}`);
     logger.error(`Full stack trace:`, err.stack);
-    return [];
+    throw err;
   }
 }
 
