@@ -1,8 +1,7 @@
-import { AsyncLocalStorage } from 'node:async_hooks';
 import type { CatalogCursor } from './catalogPagination.js';
 import { envInt } from '../utils/envNumber';
 
-export const MAX_CATALOG_PAGE_SIZE = 100;
+export const MAX_CATALOG_RESPONSE_LIMIT = 100;
 
 export type CatalogPageSizeMode = 'fixed' | 'request';
 
@@ -10,19 +9,13 @@ interface CatalogRequestLike {
   query?: Record<string, unknown>;
 }
 
-interface CatalogPageSizeContext {
-  pageSize: number;
-}
-
-const pageSizeContext = new AsyncLocalStorage<CatalogPageSizeContext>();
-
-function clampPageSize(value: number, fallback: number): number {
+function clampResponseLimit(value: number, fallback: number): number {
   if (!Number.isInteger(value) || value <= 0) return fallback;
-  return Math.min(value, MAX_CATALOG_PAGE_SIZE);
+  return Math.min(value, MAX_CATALOG_RESPONSE_LIMIT);
 }
 
 function configuredPageSize(name: string, fallback: number): number {
-  return clampPageSize(envInt(name, fallback, 1), fallback);
+  return clampResponseLimit(envInt(name, fallback, 1), fallback);
 }
 
 function scalarQueryValue(value: unknown): unknown {
@@ -33,13 +26,13 @@ export function parseCatalogRequestLimit(value: unknown): number | null {
   const scalar = scalarQueryValue(value);
   if (typeof scalar === 'number') {
     return Number.isInteger(scalar) && scalar > 0
-      ? Math.min(scalar, MAX_CATALOG_PAGE_SIZE)
+      ? Math.min(scalar, MAX_CATALOG_RESPONSE_LIMIT)
       : null;
   }
   if (typeof scalar !== 'string' || !/^\d+$/.test(scalar)) return null;
   const parsed = Number(scalar);
   return Number.isSafeInteger(parsed) && parsed > 0
-    ? Math.min(parsed, MAX_CATALOG_PAGE_SIZE)
+    ? Math.min(parsed, MAX_CATALOG_RESPONSE_LIMIT)
     : null;
 }
 
@@ -83,7 +76,7 @@ export function catalogRequestLimitFallback(): number {
   return configuredPageSize('CATALOG_REQUEST_LIMIT_FALLBACK', 20);
 }
 
-export function resolveCatalogPageSize(
+export function resolveCatalogResponseLimit(
   req: CatalogRequestLike | undefined,
   pathExtraArgs: Record<string, unknown> = {},
   cursorState: CatalogCursor | null = null
@@ -97,72 +90,20 @@ export function resolveCatalogPageSize(
   if (nestedLimit !== null) return nestedLimit;
 
   if (cursorState?.served === requestedSkip(pathExtraArgs)) {
-    const cursorPageSize = parseCatalogRequestLimit(cursorState.pageSize);
-    if (cursorPageSize !== null) return cursorPageSize;
+    const cursorLimit = parseCatalogRequestLimit(cursorState.responseLimit);
+    if (cursorLimit !== null) return cursorLimit;
   }
 
   return catalogRequestLimitFallback();
 }
 
-export function enterCatalogPageSizeContext(pageSize: number): void {
-  pageSizeContext.enterWith({
-    pageSize: clampPageSize(pageSize, catalogRequestLimitFallback()),
-  });
-}
-
+/**
+ * Provider and local pagination always use the canonical server page size.
+ * Client response limits are resolved separately by resolveCatalogResponseLimit().
+ */
 export function catalogRequestPageSize(): number {
-  const scoped = pageSizeContext.getStore()?.pageSize;
-  if (scoped) return scoped;
-  return catalogPageSizeMode() === 'fixed'
-    ? fixedCatalogPageSize()
-    : catalogRequestLimitFallback();
+  return fixedCatalogPageSize();
 }
 
-export function withCatalogPageSizeCacheArg(
-  args: Record<string, unknown>,
-  pageSize: number
-): Record<string, unknown> {
-  return { ...args, _pageSize: clampPageSize(pageSize, fixedCatalogPageSize()) };
-}
-
-export function resolveCatalogUpstreamPageSize(
-  cleanId: string,
-  effectivePageSize: number,
-  mode: CatalogPageSizeMode = catalogPageSizeMode()
-): number {
-  const effective = clampPageSize(effectivePageSize, fixedCatalogPageSize());
-  const fixed = fixedCatalogPageSize();
-  const malPageSize = configuredPageSize('MAL_PAGE_SIZE', 25);
-
-  if (mode === 'request') {
-    if (cleanId.startsWith('flixpatrol.')) return Math.min(10, effective);
-    if (cleanId.startsWith('mal.userlist.') || cleanId === 'mal.suggestions') return effective;
-    if (cleanId.includes('mal.')) return Math.min(malPageSize, effective);
-    if (cleanId.startsWith('anilist.')) return Math.min(50, effective);
-    if (cleanId.startsWith('tmdb.') || cleanId.startsWith('streaming.')) return Math.min(20, effective);
-    return effective;
-  }
-
-  if (cleanId.startsWith('flixpatrol.')) return 10;
-  if (cleanId.startsWith('mal.userlist.') || cleanId === 'mal.suggestions') return fixed;
-  if (cleanId.includes('mal.')) return malPageSize;
-  if (cleanId === 'anilist.trending' || cleanId.startsWith('anilist.discover')) return 50;
-  if (
-    cleanId.startsWith('simkl.watchlist.') ||
-    cleanId.startsWith('simkl.upnext') ||
-    cleanId.startsWith('simkl.dvd.') ||
-    cleanId.startsWith('simkl.trending.') ||
-    cleanId.startsWith('simkl.recipe.') ||
-    cleanId.startsWith('stremthru.') ||
-    cleanId.startsWith('mdblist.') ||
-    cleanId.startsWith('custom.') ||
-    cleanId.startsWith('trakt.') ||
-    cleanId.startsWith('anilist.') ||
-    cleanId.startsWith('letterboxd.') ||
-    cleanId.startsWith('movielens.') ||
-    (cleanId.startsWith('tvdb.') && !cleanId.startsWith('tvdb.collection.'))
-  ) {
-    return fixed;
-  }
-  return 20;
-}
+// Backward-compatible export for integrations that imported the old helper name.
+export const resolveCatalogPageSize = resolveCatalogResponseLimit;

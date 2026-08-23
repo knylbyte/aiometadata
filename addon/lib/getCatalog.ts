@@ -160,6 +160,111 @@ async function getCatalog(type: string, language: string, page: number, id: stri
   }
 }
 
+interface CatalogBatchFetchOptions {
+  type: string;
+  language: string;
+  id: string;
+  genre: string | null;
+  config: UserConfig;
+  userUUID: string;
+  includeVideos?: boolean;
+  offset: number;
+  limit: number;
+}
+
+async function fetchCatalogBatch(options: CatalogBatchFetchOptions): Promise<{
+  supported: boolean;
+  items: any[];
+  rawCount: number;
+  nextOffset: number;
+  exhausted: boolean;
+}> {
+  const { type, language, id, genre, config, includeVideos = false, offset, limit } = options;
+  if (!id.startsWith('mdblist.') || id.startsWith('mdblist.discover.') || id === 'mdblist.upnext') {
+    return { supported: false, items: [], rawCount: 0, nextOffset: offset, exhausted: false };
+  }
+
+  const catalogConfig = config.catalogs?.find(c => c.id === id);
+  const apiKey = config.apiKeys?.mdblist || process.env.MDBLIST_API_KEY || process.env.BUILT_IN_MDBLIST_API_KEY || '';
+  const { convertGenreToSlug, fetchMDBListExternalItems, fetchMDBListItems } = await import('../utils/mdbList.js');
+  const genreSlug = await convertGenreToSlug(genre, apiKey);
+  const sort = catalogConfig?.sort === 'default' ? undefined : catalogConfig?.sort;
+  const order = catalogConfig?.sort === 'default' ? undefined : catalogConfig?.order;
+  const scoreFiltersAllowed = supportsMdblistScoreFilters(catalogConfig);
+  let response: { items: any[]; hasMore?: boolean };
+
+  if (usesMdblistExternalItemsEndpoint(catalogConfig)) {
+    response = await fetchMDBListExternalItems(
+      catalogConfig.sourceUrl,
+      apiKey,
+      language,
+      1,
+      sort,
+      order,
+      genreSlug,
+      type,
+      catalogConfig.type === 'all',
+      catalogConfig?.filter_score_min,
+      catalogConfig?.filter_score_max,
+      catalogConfig?.cacheTTL,
+      limit,
+      offset,
+      true
+    );
+  } else {
+    let listId: string;
+    let unified: boolean | undefined;
+    let mediaTypeFilter: string | undefined;
+    if (id === 'mdblist.watchlist') {
+      listId = 'watchlist';
+      unified = true;
+    } else if (id === 'mdblist.watchlist.movies' || id === 'mdblist.watchlist.series') {
+      listId = 'watchlist';
+      unified = false;
+    } else if (id.startsWith('mdblist.recommended.')) {
+      const parts = id.split('.');
+      listId = `recommended/${parts[2]}`;
+      unified = true;
+      if (parts[3] === 'movies') mediaTypeFilter = 'movie';
+      else if (parts[3] === 'series') mediaTypeFilter = 'show';
+    } else {
+      listId = id.split('.')[1];
+      unified = catalogConfig?.sourceUrl ? catalogConfig?.type === 'all' : true;
+    }
+
+    response = await fetchMDBListItems(
+      listId,
+      apiKey,
+      language,
+      1,
+      sort,
+      order,
+      genreSlug,
+      unified,
+      type,
+      catalogConfig?.cacheTTL,
+      scoreFiltersAllowed ? catalogConfig?.filter_score_min : undefined,
+      scoreFiltersAllowed ? catalogConfig?.filter_score_max : undefined,
+      mediaTypeFilter,
+      limit,
+      offset,
+      true
+    );
+  }
+
+  const rawItems = response.items || [];
+  const metas = await parseMDBListItems(rawItems, type, language, config, includeVideos);
+  const rawCount = rawItems.length;
+  const exhausted = rawCount === 0 || (response.hasMore === false && rawCount < limit);
+  return {
+    supported: true,
+    items: metas,
+    rawCount,
+    nextOffset: offset + rawCount,
+    exhausted,
+  };
+}
+
 
 /**
  * Get MAL discover catalog items.
@@ -3713,4 +3818,4 @@ async function getMergedCatalog(
   return collected;
 }
 
-export { getCatalog };
+export { getCatalog, fetchCatalogBatch };

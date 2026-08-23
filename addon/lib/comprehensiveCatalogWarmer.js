@@ -1,12 +1,15 @@
 require('dotenv').config();
 const {
   cacheWrapCatalog,
+  readCatalogCache,
   cacheWrapGlobal,
   cacheWrapJikanApi,
   stableStringify,
   projectCatalogPayloadForCache,
   writeMetaComponentsBatchWithConfig,
 } = require('./getCache');
+const { fixedCatalogPageSize } = require('./catalogPageSize');
+const { buildCanonicalCatalogCacheArgs, createSequentialPageBatchFetcher, hydrateCanonicalPageWindow, resolveCanonicalPageWindow, resolveCatalogProviderCapabilities } = require('./catalogFetchPlanner');
 const { getGenreList } = require('./getGenreList');
 const { parseAnimeCatalogMetaBatch } = require('../utils/parseProps');
 const { envInt } = require('../utils/envNumber');
@@ -20,7 +23,7 @@ const EXPIRY_TOLERANCE_MS = 1000;
 const consola = require('consola');
 const { loadConfigFromDatabase } = require('./configApi.js');
 const { resolveDynamicTmdbDiscoverParams } = require('./tmdbDiscoverDateTokens');
-const { supportsMdblistScoreFilters } = require('../utils/mdbList');
+const { supportsMdblistScoreFilters, usesMdblistExternalItemsEndpoint } = require('../utils/mdbList');
 const { getTvmazeScheduleCatalog } = require('./tvmazeScheduleCatalog');
 const crypto = require('crypto');
 const { runWithRequestContext } = require('./logBuffer.js');
@@ -691,10 +694,6 @@ class ComprehensiveCatalogWarmer {
 
     this.log('debug', `Starting to warm catalog: ${catalogId} with UUID: ${uuid}${shouldIncludeGenreNone ? ' (with genre=None)' : ''}`);
 
-    if (catalogId.startsWith('stremthru.') || catalogId.startsWith('custom.')) {
-      return await this.warmExternalAddonCatalog(catalogId, catalog, genreValue, config, uuid);
-    }
-
     let currentPage = 1;
     let totalItems = 0;
     const maxPages = this.config.maxPagesPerCatalog;
@@ -858,13 +857,31 @@ class ComprehensiveCatalogWarmer {
 
           const derivedPage = currentPage;
           const actualType = catalog.type;
-          const catalogKey = `${catalogId}:${actualType}:${stableStringify(extraArgs || {})}`;
-
-          const result = await cacheWrapCatalog(uuid, catalogKey, async () => {
+          const canonicalPageSize = fixedCatalogPageSize();
+          const capabilities = resolveCatalogProviderCapabilities(catalogId, catalogConfig, canonicalPageSize);
+          const pagesThisPass = Math.min(
+            maxPages - currentPage + 1,
+            capabilities.supportsVariableLimit
+              ? Math.max(1, Math.floor(capabilities.maxLimit / canonicalPageSize))
+              : 1
+          );
+          const window = resolveCanonicalPageWindow(
+            (currentPage - 1) * canonicalPageSize,
+            pagesThisPass * canonicalPageSize,
+            canonicalPageSize
+          );
+          const keyForPage = (page) => {
+            const pageArgs = buildCanonicalCatalogCacheArgs(extraArgs || {}, page, canonicalPageSize);
+            if (catalogId.startsWith('mdblist.') && usesMdblistExternalItemsEndpoint(catalogConfig)) {
+              pageArgs._mdblistPaging = 'typed-canonical-v3';
+            }
+            return `${catalogId}:${actualType}:${stableStringify(pageArgs)}`;
+          };
+          const fetchWarmPage = async (page) => {
           // Check if this is a MAL catalog
           if (catalogId.startsWith('mal.')) {
             const configWithUUID = { ...config, userUUID: uuid };
-            const fullResult = await this.warmMALCatalog(catalogId, derivedPage, configWithUUID, extraArgs);
+            const fullResult = await this.warmMALCatalog(catalogId, page, configWithUUID, extraArgs);
             return await this.persistFullMetasAndProjectCatalog(fullResult, configWithUUID, actualType);
           } else if (catalogId === 'tmdb.trending') {
             // Special handling for tmdb.trending - call getTrending directly
@@ -873,15 +890,15 @@ class ComprehensiveCatalogWarmer {
             }
             const configWithUUID = { ...config, userUUID: uuid };
             const { getTrending } = require('./getTrending');
-            const fullResult = await getTrending(catalog.type, config.language, derivedPage, extraArgs.genre || null, configWithUUID, uuid, true);
+            const fullResult = await getTrending(catalog.type, config.language, page, extraArgs.genre || null, configWithUUID, uuid, true);
             return await this.persistFullMetasAndProjectCatalog(fullResult, configWithUUID, actualType);
           } else if (catalogId === 'tvmaze.schedule') {
             const configWithUUID = { ...config, userUUID: uuid };
             const fullResult = await getTvmazeScheduleCatalog({
               date: extraArgs.date,
               country: extraArgs.genre || '',
-              page: derivedPage,
-              pageSize: 20,
+              page,
+              pageSize: canonicalPageSize,
               language: config.language || 'en-US',
               config: configWithUUID,
               userUUID: uuid,
@@ -898,25 +915,63 @@ class ComprehensiveCatalogWarmer {
             // Add userUUID to config object for parseStremThruItems
             const configWithUUID = { ...config, userUUID: uuid };
             const { getCatalog } = require('./getCatalog');
-            const fullResult = await getCatalog(catalog.type, config.language, derivedPage, catalogId, extraArgs.genre || null, configWithUUID, uuid, true);
+            const fullResult = await getCatalog(catalog.type, config.language, page, catalogId, extraArgs.genre || null, configWithUUID, uuid, true);
             return await this.persistFullMetasAndProjectCatalog(fullResult, configWithUUID, actualType, {
               useShowPoster: !!extraArgs.useShowPoster,
             });
           }
-          }, {
-            enableErrorCaching: false,
-            maxRetries: 1,
-            config,
-            onHit: () => {
-              this.stats.pagesFromCache++;
-              if (this.stats.uuidStats[uuid]) this.stats.uuidStats[uuid].pagesFromCache++;
-            },
+          };
+          const sequentialBatchFetch = createSequentialPageBatchFetcher(capabilities, async page => {
+            return (await fetchWarmPage(page))?.metas || [];
+          });
+          const fetchProviderBatch = async batch => {
+            if (capabilities.supportsVariableLimit && !capabilities.cursorBased) {
+              const { fetchCatalogBatch } = require('./getCatalog');
+              const configWithUUID = { ...config, userUUID: uuid };
+              const batchResult = await fetchCatalogBatch({
+                type: catalog.type,
+                language: config.language,
+                id: catalogId,
+                genre: extraArgs.genre || null,
+                config: configWithUUID,
+                userUUID: uuid,
+                includeVideos: true,
+                offset: batch.offset,
+                limit: batch.limit,
+              });
+              if (batchResult.supported) {
+                const projected = await this.persistFullMetasAndProjectCatalog(
+                  { metas: batchResult.items }, configWithUUID, actualType
+                );
+                return { ...batchResult, items: projected.metas || [] };
+              }
+            }
+            return sequentialBatchFetch(batch);
+          };
+          const result = await hydrateCanonicalPageWindow({
+            window,
+            capabilities,
+            readPage: page => readCatalogCache(uuid, keyForPage(page), {
+              config,
+              onHit: () => {
+                this.stats.pagesFromCache++;
+                if (this.stats.uuidStats[uuid]) this.stats.uuidStats[uuid].pagesFromCache++;
+              },
+            }),
+            writePage: (page, value) => cacheWrapCatalog(uuid, keyForPage(page), async () => value, {
+              enableErrorCaching: false,
+              maxRetries: 1,
+              config,
+            }),
+            fetchBatch: fetchProviderBatch,
           });
 
-          const rawMetaCount = result?.metas?.length || 0;
+          const resultMetas = window.pages.flatMap(page => result.pages.get(page)?.metas || []);
+
+          const rawMetaCount = resultMetas.length;
 
           if (rawMetaCount > 0) {
-            imageWarmQueue.offer(collectWarmupTargets(result.metas, config, catalog.type));
+            imageWarmQueue.offer(collectWarmupTargets(resultMetas, config, catalog.type));
           }
 
           if (rawMetaCount === 0) {
@@ -925,7 +980,7 @@ class ComprehensiveCatalogWarmer {
           }
 
           totalItems += rawMetaCount;
-          currentPage++;
+          currentPage += window.pages.length;
 
           await this.delay(this.config.taskDelayMs);
       } catch (error) {

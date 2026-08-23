@@ -9,7 +9,7 @@ export interface CatalogCursor {
   served: number;
   upstreamPage: number;
   pageOffset: number;
-  pageSize?: number;
+  responseLimit?: number;
 }
 
 export function fillMaxPages(): number {
@@ -31,7 +31,7 @@ export function cursorKey(
   type: string,
   genre: string | undefined | null
 ): string {
-  return `catalog-cursor:v2:${userUUID}:${cleanId}:${type}:${genre || 'all'}`;
+  return `catalog-cursor:v3:${userUUID}:${cleanId}:${type}:${genre || 'all'}`;
 }
 
 export async function readCursor(key: string): Promise<CatalogCursor | null> {

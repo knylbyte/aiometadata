@@ -536,19 +536,19 @@ These caps bound the per-process heap used by module-level caches. The defaults 
 ### `CATALOG_PAGE_SIZE_MODE`
 - **Default**: `fixed`
 - **Values**: `fixed`, `request`
-- **Description**: In `fixed` mode every catalog response uses `CATALOG_LIST_ITEMS_SIZE` and ignores client limits. In `request` mode a valid client limit is used and remembered in the catalog cursor for follow-up requests.
+- **Description**: Controls only the maximum number of metas returned to the client. In `fixed` mode every catalog response is capped at `CATALOG_LIST_ITEMS_SIZE`. In `request` mode a valid client limit is used and remembered in the catalog cursor for follow-up requests. Client limits never change internal cache-page geometry.
 - **Supported Requests**: `?limit=100` and `?extra=limit%3D100`
 
 ### `CATALOG_LIST_ITEMS_SIZE`
 - **Default**: `20`
 - **Range**: `1` to `100`
-- **Description**: Fixed catalog page size used when `CATALOG_PAGE_SIZE_MODE=fixed`.
+- **Description**: Canonical internal catalog cache-page size. All clients share these pages regardless of requested response limit. In `fixed` mode this is also the client response limit.
 - **Example**: `CATALOG_LIST_ITEMS_SIZE=20`
 
 ### `CATALOG_REQUEST_LIMIT_FALLBACK`
 - **Default**: `20`
 - **Range**: `1` to `100`
-- **Description**: Page size used in request mode when the client sends no valid limit and no matching catalog cursor stores the sequence's page size.
+- **Description**: Client response limit used in request mode when the client sends no valid limit and no matching catalog cursor stores the sequence's response limit. It does not affect internal cache pages or provider cache keys.
 - **Example**: `CATALOG_REQUEST_LIMIT_FALLBACK=20`
 
 ### `MAX_CATALOGS`

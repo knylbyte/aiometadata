@@ -1582,6 +1582,20 @@ async function cacheWrapSearch(userUUID: string, searchKey: string, method: () =
   return result;
 }
 
+async function readCatalogCache(userUUID: string, catalogKey: string, options: any = {}): Promise<any | null> {
+  let hit = false;
+  const callerOnHit = options.onHit;
+  const result = await cacheWrapCatalog(userUUID, catalogKey, async () => null, {
+    ...options,
+    maxRetries: 0,
+    onHit: (details: any) => {
+      hit = true;
+      if (typeof callerOnHit === 'function') callerOnHit(details);
+    },
+  });
+  return hit ? result : null;
+}
+
 async function cacheWrapMeta(userUUID: string, metaId: string, method: () => Promise<any>, ttl: number = META_TTL(), options: any = {}, type: string | null = null): Promise<any> {
    let config: any;
    try {
@@ -2478,6 +2492,7 @@ export {
   deleteKeysByPattern,
   scanKeys,
   cacheWrapCatalog,
+  readCatalogCache,
   cacheWrapSearch,
   cacheWrapJikanApi,
   cacheWrapMDBListGenres,
@@ -2510,6 +2525,7 @@ module.exports = {
   deleteKeysByPattern,
   scanKeys,
   cacheWrapCatalog,
+  readCatalogCache,
   cacheWrapSearch,
   cacheWrapJikanApi,
   cacheWrapMDBListGenres,

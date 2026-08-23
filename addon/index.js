@@ -9,15 +9,16 @@ const addon = express();
 // Honor X-Forwarded-* headers from reverse proxies (e.g., Traefik) so req.protocol reflects HTTPS
 //addon.set('trust proxy', true);
 
-const { getCatalog } = require("./lib/getCatalog");
+const { getCatalog, fetchCatalogBatch } = require("./lib/getCatalog");
 const { applyCatalogFilters, catalogFiltersActive } = require("./utils/catalogFilters");
 const { cursorKey, readCursor, resolveStartPage, writeCursor, fillFilteredPage, fillMaxPages } = require("./lib/catalogPagination");
-const { catalogPageSizeMode, enterCatalogPageSizeContext, resolveCatalogPageSize, resolveCatalogUpstreamPageSize, withCatalogPageSizeCacheArg } = require("./lib/catalogPageSize");
+const { catalogPageSizeMode, fixedCatalogPageSize, resolveCatalogResponseLimit } = require("./lib/catalogPageSize");
+const { buildCanonicalCatalogCacheArgs, createSequentialPageBatchFetcher, hydrateCanonicalPageWindow, resolveCanonicalPageWindow, resolveCatalogProviderCapabilities } = require("./lib/catalogFetchPlanner");
 const anilist = require("./lib/anilist");
 const { getSearch } = require("./lib/getSearch");
 const { getManifest, DEFAULT_LANGUAGE } = require("./lib/getManifest");
 const { getMeta } = require("./lib/getMeta");
-const { cacheWrapMetaSmart, cacheWrapCatalog, cacheWrapSearch, cacheWrapJikanApi, cacheWrapStaticCatalog, cacheWrapGlobal, getCacheHealth, clearCacheHealth, logCacheHealth, stableStringify, deleteKeysByPattern, scanKeys } = require("./lib/getCache");
+const { cacheWrapMetaSmart, cacheWrapCatalog, readCatalogCache, cacheWrapSearch, cacheWrapJikanApi, cacheWrapStaticCatalog, cacheWrapGlobal, getCacheHealth, clearCacheHealth, logCacheHealth, stableStringify, deleteKeysByPattern, scanKeys } = require("./lib/getCache");
 const { hasPermission } = require("./lib/authSession");
 const { isOidcConfigured } = require("./lib/oidc");
 const { resolveConfigAccess } = require("./lib/configAccess");
@@ -4359,28 +4360,19 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
   const storedCursor = pageSizeMode === 'request' && skipValue > 0
     ? await readCursor(pageSizeCursorKey)
     : null;
-  const effectivePageSize = resolveCatalogPageSize(req, extraArgs, storedCursor);
-  enterCatalogPageSizeContext(effectivePageSize);
-
-  const upstreamPageSize = resolveCatalogUpstreamPageSize(cleanId, effectivePageSize, pageSizeMode);
-  const pageSizeRequiresCursor = effectivePageSize !== upstreamPageSize;
-  const useOuterPageSizeCursor = pageSizeMode === 'request' || pageSizeRequiresCursor;
+  const responseLimit = resolveCatalogResponseLimit(req, extraArgs, storedCursor);
+  const canonicalPageSize = fixedCatalogPageSize();
+  const useOuterPageSizeCursor = pageSizeMode === 'request'
+    || responseLimit !== canonicalPageSize
+    || (skipValue % canonicalPageSize) !== 0;
   const isOffsetBased = cleanId.startsWith('stremthru.') || cleanId.startsWith('custom.') || cleanId.startsWith('merged.');
-  const usePreciseLegacyOffset = useOuterPageSizeCursor;
   const catalogPage = skipValue > 0
-    ? (usePreciseLegacyOffset
-        ? Math.floor(skipValue / upstreamPageSize) + 1
-        : (isOffsetBased
-            ? Math.floor(skipValue / upstreamPageSize) + 1
-            : Math.ceil(skipValue / upstreamPageSize) + 1))
+    ? Math.floor(skipValue / canonicalPageSize) + 1
     : 1;
-  const catalogPageOffset = usePreciseLegacyOffset ? skipValue % upstreamPageSize : 0;
+  const catalogPageOffset = skipValue % canonicalPageSize;
 
-  // Build cache key with page instead of skip for stable cache hits
-  const cacheExtraArgs = withCatalogPageSizeCacheArg({ ...extraArgs }, effectivePageSize);
-  delete cacheExtraArgs.skip;
-  if (catalogPage > 1) cacheExtraArgs.page = catalogPage;
-  if (catalogPageOffset > 0) cacheExtraArgs._pageOffset = catalogPageOffset;
+  // Canonical cache pages never vary with the client response limit.
+  const cacheExtraArgs = buildCanonicalCatalogCacheArgs({ ...extraArgs }, 1, canonicalPageSize);
 
   const filtersActive = catalogFiltersActive({
     config,
@@ -4393,7 +4385,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
   const useCursorPagination = filtersActive || isCursorSensitiveMdblistCatalog || useOuterPageSizeCursor;
 
   if (isCursorSensitiveMdblistCatalog) {
-    cacheExtraArgs._mdblistPaging = 'typed-cursor-v2';
+    cacheExtraArgs._mdblistPaging = 'typed-canonical-v3';
   }
 
   if (cleanId.startsWith('simkl.watchlist.') || cleanId.startsWith('simkl.upnext')) {
@@ -4447,8 +4439,6 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
       consola.warn(`[Catalog] MovieLens group tags failed for ${cleanId}: ${e.message}`);
     }
   }
-
-  const catalogKey = `${cleanId}:${actualType}:${stableStringify(cacheExtraArgs)}`;
 
   const cacheOptions = {
     enableErrorCaching: true,
@@ -4538,7 +4528,8 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
       const searchExtraArgs = { ...extraArgs };
       delete searchExtraArgs.skip;
       if (searchPage > 1) searchExtraArgs.page = searchPage;
-      searchExtraArgs._pageSize = effectivePageSize;
+      delete searchExtraArgs.limit;
+      delete searchExtraArgs._pageSize;
 
       // Optional keyword gate for AI search.
       const aiKeyword = getAiTriggerKeyword(config);
@@ -4642,43 +4633,87 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     };
 
     const keyForPage = (page) => {
-      const pageArgs = { ...cacheExtraArgs };
-      if (page > 1) pageArgs.page = page; else delete pageArgs.page;
+      const pageArgs = buildCanonicalCatalogCacheArgs(cacheExtraArgs, page, canonicalPageSize);
       return `${cleanId}:${actualType}:${stableStringify(pageArgs)}`;
     };
 
-    const legacySkip = extraArgs.skip ? parseInt(extraArgs.skip) : undefined;
-    const readPage = (page, skipOverride) =>
-      cacheWrapper(userUUID, keyForPage(page), () => runCatalogPage(page, skipOverride), cacheOptions);
+    const capabilities = resolveCatalogProviderCapabilities(cleanId, catalogConfig, canonicalPageSize);
+    const sequentialBatchFetch = createSequentialPageBatchFetcher(capabilities, async (page) => {
+      const pageSkip = isOffsetBased ? (page - 1) * capabilities.fixedPageSize : undefined;
+      return (await runCatalogPage(page, pageSkip))?.metas || [];
+    });
+    const fetchProviderBatch = async (batch) => {
+      if (capabilities.supportsVariableLimit && !capabilities.cursorBased) {
+        const result = await fetchCatalogBatch({
+          type: actualType,
+          language,
+          id: cleanId,
+          genre: genreName || null,
+          config,
+          userUUID,
+          includeVideos: false,
+          offset: batch.offset,
+          limit: batch.limit,
+        });
+        if (result.supported) return result;
+      }
+      return sequentialBatchFetch(batch);
+    };
+    const readCachedPage = (page) => readCatalogCache(userUUID, keyForPage(page), { config });
+    const writeCachedPage = (page, value) =>
+      cacheWrapper(userUUID, keyForPage(page), async () => value, cacheOptions);
+    const hydrateWindow = async (absoluteSkip, limit) => hydrateCanonicalPageWindow({
+      window: resolveCanonicalPageWindow(absoluteSkip, limit, canonicalPageSize),
+      capabilities,
+      readPage: readCachedPage,
+      writePage: writeCachedPage,
+      fetchBatch: fetchProviderBatch,
+      maxBatches: Math.max(20, fillMaxPages() * 4),
+    });
+    const getCanonicalPage = async (page) => {
+      const cached = await readCachedPage(page);
+      if (cached) return cached;
+      const hydrated = await hydrateWindow((page - 1) * canonicalPageSize, canonicalPageSize);
+      return hydrated.pages.get(page) || { metas: [] };
+    };
 
       if (useCursorPagination) {
       const key = pageSizeCursorKey;
       const { startPage, startOffset, matched } = await resolveStartPage(key, skipValue, catalogPage, catalogPageOffset);
+      await hydrateWindow((startPage - 1) * canonicalPageSize + startOffset, responseLimit);
+      const seenFilteredIds = new Set();
 
       const filled = await fillFilteredPage({
         startPage,
         startOffset,
-        pageSize: effectivePageSize,
-        sourcePageSize: upstreamPageSize,
-        maxPages: Math.max(fillMaxPages(), Math.ceil((effectivePageSize + startOffset) / upstreamPageSize)),
+        pageSize: responseLimit,
+        sourcePageSize: canonicalPageSize,
+        maxPages: Math.max(fillMaxPages(), Math.ceil((responseLimit + startOffset) / canonicalPageSize) + fillMaxPages()),
         fetchPage: async (page) => {
-          const pageSkip = isOffsetBased ? (page - 1) * upstreamPageSize : undefined;
-          return (await readPage(page, pageSkip))?.metas || [];
+          return (await getCanonicalPage(page))?.metas || [];
         },
-        filter: (metas) => applyCatalogFilters(metas, { type: actualType, config, catalogConfig, cleanId }),
+        filter: async (metas) => {
+          const filtered = await applyCatalogFilters(metas, { type: actualType, config, catalogConfig, cleanId });
+          return filtered.filter((meta) => {
+            if (!meta?.id) return true;
+            if (seenFilteredIds.has(meta.id)) return false;
+            seenFilteredIds.add(meta.id);
+            return true;
+          });
+        },
       });
 
       responseData = { metas: filled.metas };
       filtersAlreadyApplied = true;
-      pendingCursor = { key, skip: skipValue, page: filled.nextPage, offset: filled.nextOffset, pageSize: effectivePageSize };
+      pendingCursor = { key, skip: skipValue, page: filled.nextPage, offset: filled.nextOffset, responseLimit };
 
       consola.debug(
-        `[Catalog] ${cleanId}: filled ${filled.metas.length}/${effectivePageSize} from ${filled.pagesRead} page(s) ` +
+        `[Catalog] ${cleanId}: filled ${filled.metas.length}/${responseLimit} from ${filled.pagesRead} canonical page(s) ` +
         `(skip=${skipValue}, start=${startPage}+${startOffset}, next=${filled.nextPage}+${filled.nextOffset}, ` +
         `cursor=${matched ? 'hit' : 'miss'}, exhausted=${filled.exhausted})`
       );
     } else {
-      responseData = await readPage(catalogPage, legacySkip);
+      responseData = await getCanonicalPage(catalogPage);
     }
     }
     if (!filtersAlreadyApplied && responseData?.metas && Array.isArray(responseData.metas) && responseData.metas.length > 0) {
@@ -4706,8 +4741,8 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
       }
     }
 
-    if (Array.isArray(responseData?.metas) && responseData.metas.length > effectivePageSize) {
-      responseData = { ...responseData, metas: responseData.metas.slice(0, effectivePageSize) };
+    if (Array.isArray(responseData?.metas) && responseData.metas.length > responseLimit) {
+      responseData = { ...responseData, metas: responseData.metas.slice(0, responseLimit) };
     }
 
     if (pendingCursor) {
@@ -4715,7 +4750,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
         served: pendingCursor.skip + (responseData?.metas?.length || 0),
         upstreamPage: pendingCursor.page,
         pageOffset: pendingCursor.offset,
-        pageSize: pendingCursor.pageSize,
+        responseLimit: pendingCursor.responseLimit,
       });
     }
 
