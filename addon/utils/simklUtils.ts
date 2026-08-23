@@ -229,7 +229,7 @@ async function getSimklRatings(
     const bucket = response?.data?.[type];
     return Array.isArray(bucket) ? bucket : [];
   } catch (error) {
-    return [];
+    throw error;
   }
 }
 
@@ -441,7 +441,7 @@ async function fetchSimklWatchlistItems(
       if (cachedList) {
         itemsToReturn = cachedList;
       } else {
-        return { items: [] };
+        throw new Error(`Simkl ${status} activity request failed without a cached list`);
       }
     } else {
       // We have API connection
@@ -535,7 +535,7 @@ async function fetchSimklWatchlistItems(
 
   } catch (error: any) {
     logger.error(`Error fetching Simkl watchlist items: ${error.message}`);
-    return { items: [] };
+    throw error;
   }
 }
 
@@ -818,7 +818,7 @@ async function fetchSimklWatchedItems(
     return Array.isArray(items) ? items : [];
   } catch (error: any) {
     logger.error(`Error fetching Simkl watched items: ${error.message}`);
-    return [];
+    throw error;
   }
 }
 
@@ -840,7 +840,7 @@ async function fetchSimklWatchingItems(
     return Array.isArray(items) ? items : [];
   } catch (error: any) {
     logger.error(`Error fetching Simkl watching items: ${error.message}`);
-    return [];
+    throw error;
   }
 }
 
@@ -1194,7 +1194,7 @@ async function fetchSimklTrendingItems(
     return { items, hasMore, totalItems, totalPages };
   } catch (err: any) {
     logger.error(`Error fetching Simkl trending ${type}, interval ${interval}, page ${page}:`, err.message);
-    return { items: [], hasMore: false };
+    throw err;
   }
 }
 
@@ -1451,7 +1451,7 @@ async function fetchSimklDvdReleases(
     return { items, hasMore, totalItems, totalPages };
   } catch (err: any) {
     logger.error(`Error fetching Simkl dvd releases: ${err.message}`);
-    return { items: [], hasMore: false, totalItems: 0 };
+    throw err;
   }
 }
 
@@ -1722,7 +1722,7 @@ async function fetchSimklCalendar(
     );
   } catch (err: any) {
     logger.error(`Error fetching Simkl calendar ${type}:`, err.message);
-    return [];
+    throw err;
   }
 }
 
@@ -1811,6 +1811,6 @@ async function fetchSimklCalendarItems(
     return { items: mappedItems };
   } catch (err: any) {
     logger.error(`Error processing Simkl calendar items:`, err.message);
-    return { items: [] };
+    throw err;
   }
 }

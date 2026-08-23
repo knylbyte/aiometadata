@@ -12,6 +12,8 @@ const {
 } = require('../dist/server/lib/catalogFetchPlanner.js');
 const {
   createCatalogSourceAdapter,
+  CATALOG_PROVIDER_REGISTRY,
+  createFixedPageAdapter,
   getCatalogProviderDefinition,
 } = require('../dist/server/lib/catalogSourceAdapter.js');
 const {
@@ -158,7 +160,7 @@ test('AniList native pages of 50 split into canonical pages of 20 without gaps',
   state.pages.delete(3);
   await hydrate(state, adapter, 40, 20);
   assert.deepEqual(state.pages.get(3).metas.map(meta => meta.id), metas(40, 20).map(meta => meta.id));
-  assert.deepEqual(providerCalls, [1, 2], 'provider page 1/2 should come from provider-batch:v1');
+  assert.deepEqual(providerCalls, [1, 2], 'provider page 1/2 should come from provider-batch:v2');
   assert.equal(getCatalogProviderDefinition({ catalogId: 'anilist.discover.test', canonicalPageSize: 20 }).capabilities.nativePageSize, 50);
 });
 
@@ -181,7 +183,7 @@ for (const error of [
   });
 }
 
-test('missing has-more information is unknown and cannot finalize a partial page', async () => {
+test('unknown exhaustion returns progress transiently without persisting a partial page', async () => {
   const calls = [];
   const adapter = {
     ...offsetAdapter([], calls),
@@ -209,7 +211,10 @@ test('missing has-more information is unknown and cannot finalize a partial page
     },
   };
   const state = memoryState();
-  await assert.rejects(() => hydrate(state, adapter, 0, 20), CatalogProviderNoProgressError);
+  const result = await hydrate(state, adapter, 0, 20);
+  assert.deepEqual(result.pages.get(1).metas.map(meta => meta.id), metas(0, 7).map(meta => meta.id));
+  assert.equal(result.pages.get(1)._canonical.transient, true);
+  assert.deepEqual(result.pages.get(1)._canonical.sourceNext, { kind: 'offset', offset: 7 });
   assert.equal(state.pages.size, 0);
   assert.equal(state.getTerminal(), null);
 });
@@ -222,7 +227,7 @@ test('an exact full batch with explicit exhaustion writes a terminal marker with
   assert.equal(result.exhausted, true);
   assert.equal(state.pages.get(1)._canonical.exhausted, true);
   assert.deepEqual(state.getTerminal(), {
-    schema: 'v4',
+    schema: 'v5',
     sourceEnd: { kind: 'offset', offset: 20 },
     lastCanonicalPage: 1,
   });
@@ -363,7 +368,7 @@ test('failed provider batches are not retained by the single-flight cache', asyn
 
 test('a terminal marker suppresses requests beyond the confirmed final page', async () => {
   const state = memoryState(new Map(), {
-    schema: 'v4',
+    schema: 'v5',
     sourceEnd: { kind: 'offset', offset: 125 },
     lastCanonicalPage: 7,
   });
@@ -412,10 +417,15 @@ test('fixed and cursor providers are fetched sequentially using adapter-native g
   }
 });
 
-test('v3 pages are not read as v4 and response limits do not fork canonical keys', async () => {
+test('v4 pages are not read as v5 and response limits do not fork canonical keys', async () => {
   const oldPage = {
     metas: metas(900, 20),
-    _canonical: { version: 'canonical-v3', sourceStartOffset: 0, sourceNextOffset: 20, exhausted: false },
+    _canonical: {
+      schema: 'v4', page: 1,
+      sourceStart: { kind: 'offset', offset: 0 },
+      sourceNext: { kind: 'offset', offset: 20 },
+      exhausted: false, entryResumes: [],
+    },
   };
   const state = memoryState(new Map([[1, oldPage]]));
   const unrelatedMetaCache = new Map([['meta:tmdb:1', { id: 'tmdb:1' }]]);
@@ -435,5 +445,130 @@ test('v3 pages are not read as v4 and response limits do not fork canonical keys
     querySignature: 'query',
     resumeState: { kind: 'offset', offset: 0 },
     requestedUpstreamLimit: 20,
-  }).startsWith('provider-batch:v1:'), true);
+  }).startsWith('provider-batch:v2:'), true);
+});
+
+test('FlixPatrol Top 10 confirms EOF on its successful empty second page', async () => {
+  clearProviderBatchCacheForTests();
+  const calls = [];
+  const adapter = createCatalogSourceAdapter({
+    catalogId: 'flixpatrol.netflix.us.movie', canonicalPageSize: 20,
+    querySignature: 'flix-top-10', type: 'movie', language: 'en-US', useRedisBatchCache: false,
+    fetchPage: async page => {
+      calls.push(page);
+      const pageMetas = page === 1 ? metas(0, 10) : [];
+      return { metas: pageMetas, rawCount: pageMetas.length };
+    },
+  });
+  const state = memoryState();
+  const result = await hydrate(state, adapter, 0, 20);
+  assert.deepEqual(calls, [1, 2]);
+  assert.equal(result.pages.get(1).metas.length, 10);
+  assert.equal(result.pages.get(1)._canonical.exhausted, true);
+  assert.equal(state.getTerminal().lastCanonicalPage, 1);
+});
+
+test('a configured short fixed page confirms EOF without an extra empty request', async () => {
+  const calls = [];
+  const fetchPage = createFixedPageAdapter({
+    providerId: 'short-page', nativePageSize: 20,
+    emptyPageConfirmsEnd: true, shortPageConfirmsEnd: true,
+    fetchPage: async page => {
+      calls.push(page);
+      const pageMetas = page === 1 ? metas(0, 20) : metas(20, 7);
+      return { metas: pageMetas, rawCount: pageMetas.length };
+    },
+  });
+  const capabilities = {
+    supportsOffset: false, supportsVariableLimit: false, maxLimit: 20, nativePageSize: 20,
+    cursorBased: false, stableOrdering: true,
+  };
+  const adapter = {
+    provider: 'short-page', sourceIdentity: 'short-page', querySignature: 'short-page',
+    capabilities, initialResumeState: { kind: 'page-index', page: 1, index: 0 },
+    fetchBatch: require('../dist/server/lib/catalogFetchPlanner.js').createSequentialPageBatchFetcher(capabilities, fetchPage),
+  };
+  const state = memoryState();
+  await hydrate(state, adapter, 20, 20);
+  assert.deepEqual(calls, [1, 2]);
+  assert.equal(state.pages.get(2).metas.length, 7);
+  assert.equal(state.getTerminal().lastCanonicalPage, 2);
+});
+
+test('Trakt Recommendations uses native pages of 50 without losing IDs 20-49', async () => {
+  clearProviderBatchCacheForTests();
+  const calls = [];
+  const adapter = createCatalogSourceAdapter({
+    catalogId: 'trakt.recommendations.movies', canonicalPageSize: 20,
+    querySignature: 'trakt-recommendations', type: 'movie', language: 'en-US', useRedisBatchCache: false,
+    fetchPage: async (page, nativePageSize) => {
+      calls.push({ page, nativePageSize });
+      return { metas: metas((page - 1) * 50, 50), rawCount: 50, hasMore: page < 2 };
+    },
+  });
+  const state = memoryState();
+  await hydrate(state, adapter, 0, 80);
+  assert.deepEqual(calls, [{ page: 1, nativePageSize: 50 }, { page: 2, nativePageSize: 50 }]);
+  assert.deepEqual(state.pages.get(1).metas.map(meta => meta.id), metas(0, 20).map(meta => meta.id));
+  assert.deepEqual(state.pages.get(2).metas.map(meta => meta.id), metas(20, 20).map(meta => meta.id));
+  assert.deepEqual(state.pages.get(3).metas.map(meta => meta.id), metas(40, 20).map(meta => meta.id));
+  assert.deepEqual(state.pages.get(4).metas.map(meta => meta.id), metas(60, 20).map(meta => meta.id));
+});
+
+test('every registered provider uses its declared fetch geometry and structured result contract', async () => {
+  for (const registryEntry of CATALOG_PROVIDER_REGISTRY) {
+    clearProviderBatchCacheForTests();
+    const definition = getCatalogProviderDefinition({ catalogId: registryEntry.testCatalogId, canonicalPageSize: 20 });
+    let usedSize = null;
+    const adapter = createCatalogSourceAdapter({
+      catalogId: registryEntry.testCatalogId, canonicalPageSize: 20,
+      querySignature: `audit-${registryEntry.id}`, type: 'movie', language: 'en-US', useRedisBatchCache: false,
+      fetchPage: async (_page, nativePageSize) => {
+        usedSize = nativePageSize;
+        return { metas: metas(0, nativePageSize), rawCount: nativePageSize, hasMore: false };
+      },
+      fetchOffsetBatch: async (resumeState, requestedRawCount) => {
+        usedSize = requestedRawCount;
+        return {
+          entries: metas(0, requestedRawCount).map((meta, index) => ({
+            meta,
+            sourcePosition: { kind: 'offset', offset: resumeState.offset + index },
+            resumeAfter: { kind: 'offset', offset: resumeState.offset + index + 1 },
+          })),
+          rawCount: requestedRawCount,
+          resumeAfterBatch: { kind: 'offset', offset: resumeState.offset + requestedRawCount },
+          exhaustion: 'not-exhausted',
+        };
+      },
+    });
+    const requestedRawCount = definition.capabilities.supportsVariableLimit ? 37 : definition.capabilities.nativePageSize;
+    const result = await adapter.fetchBatch({
+      resumeState: adapter.initialResumeState, requestedRawCount, limit: requestedRawCount,
+      sequential: !definition.capabilities.supportsVariableLimit,
+    });
+    assert.equal(usedSize, requestedRawCount, registryEntry.id);
+    assert.ok(Array.isArray(result.entries), registryEntry.id);
+    assert.ok(Number.isInteger(result.rawCount), registryEntry.id);
+  }
+});
+
+test('fixed-page adapters reject naked arrays and propagate provider errors', async () => {
+  const naked = createFixedPageAdapter({
+    providerId: 'naked', nativePageSize: 20, emptyPageConfirmsEnd: true, shortPageConfirmsEnd: true,
+    fetchPage: async () => [],
+  });
+  await assert.rejects(() => naked(1), /naked or invalid/);
+  for (const error of [
+    Object.assign(new Error('HTTP 429'), { status: 429 }),
+    Object.assign(new Error('HTTP 503'), { status: 503 }),
+    Object.assign(new Error('auth'), { status: 401 }),
+    new Error('timeout'), new SyntaxError('invalid json'),
+  ]) {
+    const adapter = createFixedPageAdapter({
+      providerId: 'failure', nativePageSize: 20,
+      emptyPageConfirmsEnd: true, shortPageConfirmsEnd: true,
+      fetchPage: async () => { throw error; },
+    });
+    await assert.rejects(() => adapter(1), error);
+  }
 });

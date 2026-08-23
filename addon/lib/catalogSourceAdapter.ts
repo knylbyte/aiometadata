@@ -1,6 +1,7 @@
 import { envInt } from '../utils/envNumber';
 import {
   createSequentialPageBatchFetcher,
+  isProviderResumeState,
   type CatalogExhaustion,
   type CatalogProviderCapabilities,
   type CatalogSourceAdapter,
@@ -10,7 +11,17 @@ import {
 } from './catalogFetchPlanner';
 import { credentialFingerprint, fetchProviderBatchCached } from './providerBatchCache';
 
-interface AdapterContext {
+export interface ProviderPageResult {
+  metas: any[];
+  rawCount: number;
+  entries?: ReconstructedCatalogEntry[];
+  resumeAfterBatch?: ProviderResumeState;
+  exhaustion?: CatalogExhaustion;
+  total?: number;
+  hasMore?: boolean;
+}
+
+export interface AdapterContext {
   catalogId: string;
   catalogConfig?: any;
   canonicalPageSize: number;
@@ -22,17 +33,25 @@ interface AdapterContext {
   credential?: string;
   forceRefresh?: boolean;
   useRedisBatchCache?: boolean;
+  providerBatchTtl?: number;
   fetchOffsetBatch?: (resume: ProviderResumeState, requestedRawCount: number) => Promise<ProviderBatchResult>;
-  fetchPage: (page: number, nativePageSize: number) => Promise<any>;
+  fetchPage: (page: number, nativePageSize: number) => Promise<ProviderPageResult>;
 }
 
-interface ProviderDefinition {
+export interface ProviderDefinition {
   provider: string;
   capabilities: CatalogProviderCapabilities;
   initialResumeState: ProviderResumeState;
 }
 
-function fixed(provider: string, nativePageSize: number): ProviderDefinition {
+export interface ProviderRegistryEntry {
+  id: string;
+  testCatalogId: string;
+  matches: (catalogId: string) => boolean;
+  resolve: (context: Pick<AdapterContext, 'catalogId' | 'canonicalPageSize'>) => ProviderDefinition;
+}
+
+function fixed(provider: string, nativePageSize: number, eof: { empty?: boolean; short?: boolean } = {}): ProviderDefinition {
   return {
     provider,
     capabilities: {
@@ -42,38 +61,120 @@ function fixed(provider: string, nativePageSize: number): ProviderDefinition {
       nativePageSize,
       cursorBased: false,
       stableOrdering: true,
+      paginationModel: 'page',
+      emptyPageConfirmsEnd: eof.empty === true,
+      shortPageConfirmsEnd: eof.short === true,
     },
     initialResumeState: { kind: 'page-index', page: 1, index: 0 },
   };
 }
 
-export function getCatalogProviderDefinition(
-  context: Pick<AdapterContext, 'catalogId' | 'canonicalPageSize'>
-): ProviderDefinition {
+function canonical(provider: string, context: Pick<AdapterContext, 'canonicalPageSize'>, short = true): ProviderDefinition {
+  return fixed(provider, Math.max(1, context.canonicalPageSize), { empty: true, short });
+}
+
+const mdblistOffset = (): ProviderDefinition => ({
+  provider: 'mdblist',
+  capabilities: {
+    supportsOffset: true,
+    supportsVariableLimit: true,
+    maxLimit: 100,
+    cursorBased: false,
+    stableOrdering: true,
+    paginationModel: 'offset',
+    emptyPageConfirmsEnd: false,
+    shortPageConfirmsEnd: false,
+  },
+  initialResumeState: { kind: 'offset', offset: 0 },
+});
+
+export const CATALOG_PROVIDER_REGISTRY: ProviderRegistryEntry[] = [
+  { id: 'mdblist-offset', testCatalogId: 'mdblist.demo.movie', matches: id => id.startsWith('mdblist.') && !id.startsWith('mdblist.discover.') && id !== 'mdblist.upnext', resolve: mdblistOffset },
+  { id: 'anilist', testCatalogId: 'anilist.trending', matches: id => id.startsWith('anilist.'), resolve: () => fixed('anilist', 50, { empty: true }) },
+  { id: 'trakt-recommendations', testCatalogId: 'trakt.recommendations.movies', matches: id => id === 'trakt.recommendations.movies' || id === 'trakt.recommendations.shows', resolve: () => fixed('trakt', 50, { empty: true, short: true }) },
+  { id: 'trakt', testCatalogId: 'trakt.trending.movies', matches: id => id.startsWith('trakt.'), resolve: context => canonical('trakt', context, false) },
+  { id: 'mal-discover', testCatalogId: 'mal.discover.sample', matches: id => id.startsWith('mal.discover.'), resolve: () => fixed('mal', 25, { empty: true, short: true }) },
+  { id: 'mal-user', testCatalogId: 'mal.userlist.watching', matches: id => id.startsWith('mal.userlist.') || id === 'mal.suggestions', resolve: context => canonical('mal', context) },
+  { id: 'mal', testCatalogId: 'mal.airing', matches: id => id.startsWith('mal.'), resolve: () => fixed('mal', envInt('MAL_PAGE_SIZE', 25, 1), { empty: true, short: true }) },
+  { id: 'flixpatrol', testCatalogId: 'flixpatrol.netflix.us.movie', matches: id => id.startsWith('flixpatrol.'), resolve: () => fixed('flixpatrol', 10, { empty: true }) },
+  { id: 'tmdb-collection', testCatalogId: 'tmdb.collection.1', matches: id => id.startsWith('tmdb.collection.'), resolve: context => canonical('tmdb', context) },
+  { id: 'tmdb', testCatalogId: 'tmdb.trending', matches: id => id.startsWith('tmdb.') || id.startsWith('streaming.'), resolve: () => fixed('tmdb', 20, { empty: true, short: true }) },
+  { id: 'tvdb', testCatalogId: 'tvdb.discover.sample', matches: id => id.startsWith('tvdb.'), resolve: context => canonical('tvdb', context) },
+  { id: 'tvmaze', testCatalogId: 'tvmaze.schedule', matches: id => id === 'tvmaze.schedule', resolve: context => canonical('tvmaze', context) },
+  { id: 'letterboxd', testCatalogId: 'letterboxd.demo', matches: id => id.startsWith('letterboxd.'), resolve: context => canonical('letterboxd', context) },
+  { id: 'simkl', testCatalogId: 'simkl.trending.movies', matches: id => id.startsWith('simkl.'), resolve: context => canonical('simkl', context) },
+  { id: 'movielens', testCatalogId: 'movielens.explore', matches: id => id.startsWith('movielens.'), resolve: context => canonical('movielens', context) },
+  { id: 'publicmetadb', testCatalogId: 'publicmetadb.list.demo', matches: id => id.startsWith('publicmetadb.'), resolve: context => canonical('publicmetadb', context) },
+  { id: 'custom', testCatalogId: 'custom.demo', matches: id => id.startsWith('custom.'), resolve: context => canonical('custom', context, false) },
+  { id: 'stremthru', testCatalogId: 'stremthru.demo', matches: id => id.startsWith('stremthru.'), resolve: context => canonical('stremthru', context, false) },
+  { id: 'merged', testCatalogId: 'merged.demo', matches: id => id.startsWith('merged.'), resolve: context => canonical('merged', context, false) },
+  { id: 'mdblist-page', testCatalogId: 'mdblist.discover.demo', matches: id => id.startsWith('mdblist.'), resolve: context => canonical('mdblist', context, false) },
+  { id: 'internal', testCatalogId: 'internal.catalog', matches: () => true, resolve: context => canonical('catalog', context, false) },
+];
+
+export function getCatalogProviderDefinition(context: Pick<AdapterContext, 'catalogId' | 'canonicalPageSize'>): ProviderDefinition {
   const id = String(context.catalogId || '');
-  if (id.startsWith('mdblist.') && !id.startsWith('mdblist.discover.') && id !== 'mdblist.upnext') {
-    return {
-      provider: 'mdblist',
-      capabilities: {
-        supportsOffset: true,
-        supportsVariableLimit: true,
-        maxLimit: 100,
-        cursorBased: false,
-        stableOrdering: true,
-      },
-      initialResumeState: { kind: 'offset', offset: 0 },
-    };
-  }
-  if (id.startsWith('anilist.')) return fixed('anilist', 50);
-  if (id.startsWith('mal.') && !id.startsWith('mal.userlist.') && id !== 'mal.suggestions') {
-    return fixed('mal', envInt('MAL_PAGE_SIZE', 25, 1));
-  }
-  if (id.startsWith('flixpatrol.')) return fixed('flixpatrol', 10);
-  if (id.startsWith('tmdb.') || id.startsWith('streaming.')) return fixed('tmdb', 20);
-  if (id.startsWith('custom.') || id.startsWith('stremthru.') || id.startsWith('merged.')) {
-    return fixed(id.split('.')[0], Math.max(1, context.canonicalPageSize));
-  }
-  return fixed(id.split('.')[0] || 'catalog', 20);
+  const entry = CATALOG_PROVIDER_REGISTRY.find(candidate => candidate.matches(id));
+  if (!entry) throw new Error(`No catalog provider adapter registered for ${id}`);
+  return entry.resolve(context);
+}
+
+export function resolveFixedPageExhaustion(input: {
+  rawCount: number;
+  nativePageSize: number;
+  page: number;
+  exhaustion?: CatalogExhaustion;
+  hasMore?: boolean;
+  total?: number;
+  emptyPageConfirmsEnd: boolean;
+  shortPageConfirmsEnd: boolean;
+}): CatalogExhaustion {
+  if (input.hasMore === true) return 'not-exhausted';
+  if (input.hasMore === false) return 'confirmed';
+  if (Number.isFinite(input.total) && ((input.page - 1) * input.nativePageSize) + input.rawCount >= Number(input.total)) return 'confirmed';
+  if (input.exhaustion) return input.exhaustion;
+  if (input.rawCount === 0 && input.emptyPageConfirmsEnd) return 'confirmed';
+  if (input.rawCount < input.nativePageSize && input.shortPageConfirmsEnd) return 'confirmed';
+  return 'unknown';
+}
+
+export function createFixedPageAdapter(input: {
+  providerId: string;
+  nativePageSize: number;
+  emptyPageConfirmsEnd: boolean;
+  shortPageConfirmsEnd: boolean;
+  fetchPage: (page: number, nativePageSize: number) => Promise<ProviderPageResult>;
+}): (page: number) => Promise<ProviderBatchResult> {
+  return async (page: number): Promise<ProviderBatchResult> => {
+    const output = await input.fetchPage(page, input.nativePageSize);
+    if (!output || Array.isArray(output) || !Array.isArray(output.metas)) {
+      throw new Error(`${input.providerId} returned a naked or invalid fixed-page result`);
+    }
+    if (!Number.isInteger(output.rawCount) || output.rawCount < 0 || output.metas.length > output.rawCount) {
+      throw new Error(`${input.providerId} returned an invalid rawCount`);
+    }
+    const exhaustion = resolveFixedPageExhaustion({
+      rawCount: output.rawCount,
+      nativePageSize: input.nativePageSize,
+      page,
+      exhaustion: output.exhaustion,
+      hasMore: output.hasMore,
+      total: output.total,
+      emptyPageConfirmsEnd: input.emptyPageConfirmsEnd,
+      shortPageConfirmsEnd: input.shortPageConfirmsEnd,
+    });
+    const pageSpan = exhaustion === 'confirmed' && output.rawCount > 0 ? output.rawCount : input.nativePageSize;
+    const entries = output.entries || output.metas.map((meta, index) => ({
+      meta,
+      sourcePosition: { kind: 'page-index' as const, page, index },
+      resumeAfter: index + 1 >= pageSpan
+        ? { kind: 'page-index' as const, page: page + 1, index: 0 }
+        : { kind: 'page-index' as const, page, index: index + 1 },
+    }));
+    const resumeAfterBatch = output.resumeAfterBatch || { kind: 'page-index' as const, page: page + 1, index: 0 };
+    if (!isProviderResumeState(resumeAfterBatch)) throw new Error(`${input.providerId} returned an invalid resume state`);
+    return { entries, rawCount: output.rawCount, resumeAfterBatch, exhaustion };
+  };
 }
 
 function sourceIdentity(context: AdapterContext, provider: string): string {
@@ -89,31 +190,6 @@ function sourceIdentity(context: AdapterContext, provider: string): string {
   });
 }
 
-function normalizePageResult(
-  output: any,
-  page: number,
-  nativePageSize: number
-): ProviderBatchResult {
-  const items = Array.isArray(output) ? output : (output?.metas || output?.items || []);
-  const info = (items as any)._providerPageInfo || output?._providerPageInfo || output || {};
-  const entries: ReconstructedCatalogEntry[] = Array.isArray(info.entries)
-    ? info.entries
-    : items.map((meta: any, index: number) => ({
-        meta,
-        sourcePosition: { kind: 'page-index', page, index },
-        resumeAfter: index + 1 >= nativePageSize
-          ? { kind: 'page-index', page: page + 1, index: 0 }
-          : { kind: 'page-index', page, index: index + 1 },
-      }));
-  const exhaustion: CatalogExhaustion = info.exhaustion || 'unknown';
-  return {
-    entries,
-    rawCount: Math.max(0, Number(info.rawCount ?? items.length) || 0),
-    resumeAfterBatch: info.resumeAfterBatch || { kind: 'page-index', page: page + 1, index: 0 },
-    exhaustion,
-  };
-}
-
 export function createCatalogSourceAdapter(context: AdapterContext): CatalogSourceAdapter {
   const definition = getCatalogProviderDefinition(context);
   const identity = sourceIdentity(context, definition.provider);
@@ -123,6 +199,7 @@ export function createCatalogSourceAdapter(context: AdapterContext): CatalogSour
     querySignature: context.querySignature,
     bypass: context.forceRefresh === true,
     useRedis: context.useRedisBatchCache,
+    ttl: context.providerBatchTtl,
   };
 
   if (definition.capabilities.supportsVariableLimit && context.fetchOffsetBatch) {
@@ -140,17 +217,20 @@ export function createCatalogSourceAdapter(context: AdapterContext): CatalogSour
   }
 
   const nativePageSize = definition.capabilities.nativePageSize || definition.capabilities.maxLimit;
+  const fixedPageAdapter = createFixedPageAdapter({
+    providerId: definition.provider,
+    nativePageSize,
+    emptyPageConfirmsEnd: definition.capabilities.emptyPageConfirmsEnd === true,
+    shortPageConfirmsEnd: definition.capabilities.shortPageConfirmsEnd === true,
+    fetchPage: context.fetchPage,
+  });
   const fetchSequential = createSequentialPageBatchFetcher(definition.capabilities, async page => {
     const normalizedResume: ProviderResumeState = { kind: 'page-index', page, index: 0 };
     return fetchProviderBatchCached({
       ...commonCache,
       resumeState: normalizedResume,
       requestedUpstreamLimit: nativePageSize,
-      loader: async () => normalizePageResult(
-        await context.fetchPage(page, nativePageSize),
-        page,
-        nativePageSize
-      ),
+      loader: () => fixedPageAdapter(page),
     });
   });
 

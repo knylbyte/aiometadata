@@ -297,7 +297,7 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     key: 'CATALOG_TTL',
     envVar: 'CATALOG_TTL',
     label: 'Catalog Cache TTL',
-    description: 'Time-to-live for catalog cache entries in seconds',
+    description: 'Maximum lifetime for canonical catalog pages. Terminal and provider-batch caches are capped to the same effective per-catalog TTL.',
     category: 'Cache',
     type: 'number',
     default: 86400,

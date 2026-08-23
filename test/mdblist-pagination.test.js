@@ -41,7 +41,9 @@ httpClient.httpGet = async (url) => {
 
 const {
   fetchMDBListExternalItems,
+  fetchMDBListItems,
   normalizeMDBListByNameItemsUrl,
+  selectMDBListResponseItems,
   usesMdblistExternalItemsEndpoint,
 } = require('../dist/server/utils/mdbList.js');
 const {
@@ -89,6 +91,28 @@ test('normalizes only public MDBList by-name item URLs for the requested catalog
   assert.equal(usesMdblistExternalItemsEndpoint({ sourceUrl: `${sourceUrl}/show` }), true);
   assert.equal(usesMdblistExternalItemsEndpoint({ sourceUrl: externalUrl }), true);
   assert.equal(usesMdblistExternalItemsEndpoint({ sourceUrl: foreignUrl }), false);
+});
+
+test('split External List and Watchlist windows advance by the complete consumed raw count', async () => {
+  const split = {
+    movies: Array.from({ length: 7 }, (_, id) => ({ id, mediatype: 'movie' })),
+    shows: Array.from({ length: 13 }, (_, id) => ({ id: 100 + id, mediatype: 'show' })),
+  };
+  assert.deepEqual(selectMDBListResponseItems(split, 'movie'), { items: split.movies, rawCount: 20, split: true });
+  assert.deepEqual(selectMDBListResponseItems(split, 'series'), { items: split.shows, rawCount: 20, split: true });
+
+  requestedUrls.length = 0;
+  httpResponses.push({ data: split, headers: { 'x-has-more': 'true' } });
+  const result = await fetchMDBListItems(
+    'watchlist', 'split-api-key', 'en-US', 1,
+    undefined, undefined, undefined, false, 'movie', 300,
+    undefined, undefined, 'movie', 20, 0, true
+  );
+  assert.equal(result.items.length, 7);
+  assert.equal(result.rawCount, 20);
+  assert.equal(requestedUrls[0].searchParams.get('mediatype'), 'movie');
+  assert.equal(requestedUrls[0].searchParams.get('offset'), '0');
+  assert.equal(requestedUrls[0].searchParams.get('limit'), '20');
 });
 
 test('uses typed URLs, limit, and offset in external MDBList HTTP requests and cache keys', async () => {

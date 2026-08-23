@@ -15,6 +15,7 @@ const { cursorKey, readCursor, readCatalogTerminal, resolveStartPage, terminalKe
 const { catalogPageSizeMode, fixedCatalogPageSize, resolveCatalogResponseLimit } = require("./lib/catalogPageSize");
 const { buildCanonicalCatalogCacheArgs, buildCatalogQuerySignature, hydrateCanonicalPageWindow, resolveCanonicalPageWindow, resumeStateForCanonicalPosition, writeCanonicalPages } = require("./lib/catalogFetchPlanner");
 const { createCatalogSourceAdapter } = require("./lib/catalogSourceAdapter");
+const { resolveEffectiveCatalogTtl } = require("./lib/catalogTtl");
 const anilist = require("./lib/anilist");
 const { getSearch } = require("./lib/getSearch");
 const { getManifest, DEFAULT_LANGUAGE } = require("./lib/getManifest");
@@ -358,16 +359,20 @@ function applyImageCachePrefix(data) {
 }
 
 const isCacheWarmingEnabled = () => process.env.ENABLE_CACHE_WARMING !== 'false';
+const getCacheWarmingInterval = () => {
+  const value = parseInt(getSetting('CACHE_WARMING_INTERVAL') || '720', 10);
+  return Number.isFinite(value) && value > 0 ? value : 720;
+};
 
 /** Called by the startup sequence once settings are loaded. */
 function startEssentialWarmingSchedules() {
-  const CACHE_WARMING_INTERVAL = parseInt(process.env.CACHE_WARMING_INTERVAL || '720', 10);
+  const cacheWarmingInterval = getCacheWarmingInterval();
 
   if (isCacheWarmingEnabled()) {
-    consola.info(`[API Cache Warming] Initializing API cache warming (interval: ${CACHE_WARMING_INTERVAL} minutes)`);
+    consola.info(`[API Cache Warming] Initializing API cache warming (interval: ${cacheWarmingInterval} minutes)`);
 
     // Schedule periodic warming (non-blocking)
-    scheduleEssentialWarming(CACHE_WARMING_INTERVAL);  
+    scheduleEssentialWarming(cacheWarmingInterval);
     // Schedule popular content warming based on CACHE_WARM_INTERVAL_HOURS env (default 24h, minimum 12h)
     const POPULAR_WARM_INTERVAL_HOURS = Math.max(12, parseInt(process.env.CACHE_WARM_INTERVAL_HOURS || '24', 10));
     const POPULAR_WARM_CHECK_INTERVAL = 15 * 60 * 1000; // Check every 15 minutes
@@ -3888,7 +3893,7 @@ addon.get("/api/cache/status", requireDashboardAdmin, (req, res) => {
   res.json({
     cacheEnabled: true,
     warmingEnabled: isCacheWarmingEnabled(),
-    warmingInterval: CACHE_WARMING_INTERVAL,
+    warmingInterval: getCacheWarmingInterval(),
     initialWarmingComplete: isInitialWarmingComplete(),
     addonVersion: ADDON_VERSION
   });
@@ -4375,7 +4380,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     cleanId.startsWith('mdblist.') &&
     usesMdblistExternalItemsEndpoint(catalogConfig);
   if (isCursorSensitiveMdblistCatalog) {
-    cacheExtraArgs._mdblistPaging = 'typed-canonical-v4';
+    cacheExtraArgs._mdblistPaging = 'typed-canonical-v5';
   }
 
   if (cleanId.startsWith('simkl.watchlist.') || cleanId.startsWith('simkl.upnext')) {
@@ -4455,11 +4460,13 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     || (skipValue % canonicalPageSize) !== 0;
   const useCursorPagination = filtersActive || isCursorSensitiveMdblistCatalog || useOuterPageSizeCursor;
   const catalogTerminalKey = terminalKey(userUUID, querySignature);
+  const catalogTtlPolicy = resolveEffectiveCatalogTtl({ catalogConfig });
 
   const cacheOptions = {
     enableErrorCaching: true,
     maxRetries: 2,
     config,
+    effectiveCatalogTtl: catalogTtlPolicy.canonicalPageTtl,
   };
   
   try {
@@ -4653,6 +4660,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
       credential: cleanId.startsWith('mdblist.')
         ? (config.apiKeys?.mdblist || process.env.MDBLIST_API_KEY || process.env.BUILT_IN_MDBLIST_API_KEY || '')
         : undefined,
+      providerBatchTtl: catalogTtlPolicy.providerBatchTtl,
       fetchOffsetBatch: async (resumeState, requestedRawCount) => {
         if (resumeState.kind !== 'offset') throw new Error(`Offset adapter received ${resumeState.kind} resume state`);
         return fetchCatalogBatch({
@@ -4669,23 +4677,44 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
       },
       fetchPage: async (page, nativePageSize) => {
         const pageSkip = isOffsetBased ? (page - 1) * nativePageSize : undefined;
-        return (await runCatalogPage(page, pageSkip))?.metas || [];
+        const result = await runCatalogPage(page, pageSkip);
+        const metas = result?.metas || [];
+        const info = metas?._providerPageInfo || result?._providerPageInfo || {};
+        return {
+          metas,
+          rawCount: Number.isInteger(info.rawCount) ? info.rawCount : metas.length,
+          entries: info.entries,
+          resumeAfterBatch: info.resumeAfterBatch,
+          exhaustion: info.exhaustion,
+          hasMore: info.hasMore,
+          total: info.total,
+        };
       },
     });
-    const readCachedPage = (page) => readCatalogCache(userUUID, keyForPage(page), { config });
+    const readCachedPage = (page) => readCatalogCache(userUUID, keyForPage(page), {
+      config,
+      effectiveCatalogTtl: catalogTtlPolicy.canonicalPageTtl,
+    });
     const writeCachedPage = (page, value) =>
       cacheWrapper(userUUID, keyForPage(page), async () => value, cacheOptions);
-    const hydrateWindow = async (absoluteSkip, limit) => hydrateCanonicalPageWindow({
-      window: resolveCanonicalPageWindow(absoluteSkip, limit, canonicalPageSize),
-      adapter: sourceAdapter,
-      readPage: readCachedPage,
-      writePage: writeCachedPage,
-      writePages: pages => writeCanonicalPages(pages, writeCachedPage),
-      readTerminal: () => readCatalogTerminal(catalogTerminalKey),
-      writeTerminal: state => writeCatalogTerminal(catalogTerminalKey, state),
-      maxBatches: Math.max(20, fillMaxPages() * 4),
-    });
+    const hydratedPages = new Map();
+    const hydrateWindow = async (absoluteSkip, limit, sourceAnchor) => {
+      const result = await hydrateCanonicalPageWindow({
+        window: resolveCanonicalPageWindow(absoluteSkip, limit, canonicalPageSize),
+        adapter: sourceAdapter,
+        readPage: readCachedPage,
+        writePage: writeCachedPage,
+        writePages: pages => writeCanonicalPages(pages, writeCachedPage),
+        readTerminal: () => readCatalogTerminal(catalogTerminalKey, catalogTtlPolicy.terminalTtl),
+        writeTerminal: state => writeCatalogTerminal(catalogTerminalKey, state, catalogTtlPolicy.terminalTtl),
+        sourceAnchor,
+        maxBatches: Math.max(20, fillMaxPages() * 4),
+      });
+      for (const [page, value] of result.pages) hydratedPages.set(page, value);
+      return result;
+    };
     const getCanonicalPage = async (page) => {
+      if (hydratedPages.has(page)) return hydratedPages.get(page);
       const cached = await readCachedPage(page);
       if (cached) return cached;
       const hydrated = await hydrateWindow((page - 1) * canonicalPageSize, canonicalPageSize);
@@ -4694,7 +4723,12 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
 
       if (useCursorPagination) {
       const { startPage, startOffset, matched } = await resolveStartPage(pageSizeCursorKey, skipValue, catalogPage, catalogPageOffset);
-      await hydrateWindow((startPage - 1) * canonicalPageSize + startOffset, responseLimit);
+      const cursorSourceResume = matched ? storedCursor?.sourceResume : undefined;
+      await hydrateWindow(
+        (startPage - 1) * canonicalPageSize + startOffset,
+        responseLimit,
+        cursorSourceResume ? { canonicalPage: startPage - 1, resumeState: cursorSourceResume } : undefined
+      );
       const seenFilteredIds = new Set();
 
       const filled = await fillFilteredPage({
@@ -4724,7 +4758,11 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
         page: filled.nextPage,
         offset: filled.nextOffset,
         responseLimit,
-        sourceResume: await resumeStateForCanonicalPosition(filled.nextPage, filled.nextOffset, getCanonicalPage),
+        sourceResume: await resumeStateForCanonicalPosition(
+          filled.nextPage,
+          filled.nextOffset,
+          async page => hydratedPages.get(page) || await readCachedPage(page)
+        ),
       };
 
       consola.debug(
@@ -4734,6 +4772,15 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
       );
     } else {
       responseData = await getCanonicalPage(catalogPage);
+      if (responseData?._canonical?.transient) {
+        pendingCursor = {
+          skip: skipValue,
+          page: catalogPage + 1,
+          offset: 0,
+          responseLimit,
+          sourceResume: responseData._canonical.sourceNext,
+        };
+      }
     }
     }
     if (!filtersAlreadyApplied && responseData?.metas && Array.isArray(responseData.metas) && responseData.metas.length > 0) {
@@ -7807,5 +7854,5 @@ async function startServerWithCacheWarming() {
 
 module.exports = {
   addon, startServerWithCacheWarming, getDashboardAPI, applyImageCachePrefix,
-  startEssentialWarmingSchedules, startMovieLensSyncSchedule,
+  startEssentialWarmingSchedules, startMovieLensSyncSchedule, getCacheWarmingInterval,
 };

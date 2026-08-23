@@ -43,6 +43,16 @@ const host = process.env.HOST_NAME?.startsWith('http')
     ? process.env.HOST_NAME
     : `https://${process.env.HOST_NAME}`;
 
+function attachProviderPageInfo(metas: any[], info: Record<string, any>): any[] {
+  const existing = (metas as any)?._providerPageInfo || {};
+  Object.defineProperty(metas, '_providerPageInfo', {
+    value: { ...existing, ...info },
+    enumerable: false,
+    configurable: true,
+  });
+  return metas;
+}
+
 async function getCatalog(type: string, language: string, page: number, id: string, genre: string, config: UserConfig, userUUID: string, includeVideos: boolean = false, skip?: number): Promise<{ metas: any[] }> {
   try {
     if (id === 'tvdb.collections') {
@@ -211,7 +221,7 @@ async function fetchCatalogBatch(options: CatalogBatchFetchOptions): Promise<Pro
   const sort = catalogConfig?.sort === 'default' ? undefined : catalogConfig?.sort;
   const order = catalogConfig?.sort === 'default' ? undefined : catalogConfig?.order;
   const scoreFiltersAllowed = supportsMdblistScoreFilters(catalogConfig);
-  let response: { items: any[]; hasMore?: boolean; exhaustion: 'confirmed' | 'not-exhausted' | 'unknown' };
+  let response: { items: any[]; rawCount: number; hasMore?: boolean; exhaustion: 'confirmed' | 'not-exhausted' | 'unknown' };
 
   if (usesMdblistExternalItemsEndpoint(catalogConfig)) {
     response = await fetchMDBListExternalItems(
@@ -241,6 +251,7 @@ async function fetchCatalogBatch(options: CatalogBatchFetchOptions): Promise<Pro
     } else if (id === 'mdblist.watchlist.movies' || id === 'mdblist.watchlist.series') {
       listId = 'watchlist';
       unified = false;
+      mediaTypeFilter = id.endsWith('.movies') ? 'movie' : 'show';
     } else if (id.startsWith('mdblist.recommended.')) {
       const parts = id.split('.');
       listId = `recommended/${parts[2]}`;
@@ -282,7 +293,7 @@ async function fetchCatalogBatch(options: CatalogBatchFetchOptions): Promise<Pro
     offset
   );
   const metas = entries.map((entry: any) => entry.meta);
-  const rawCount = rawItems.length;
+  const rawCount = response.rawCount;
   const resumeAfterBatch: ProviderResumeState = { kind: 'offset', offset: offset + rawCount };
   return {
     supported: true,
@@ -374,10 +385,14 @@ async function getMalDiscoverCatalog(
     );
 
     logger.success(`[MAL Discover] Processed ${metas.length} items for ${catalogId} (page ${page})`);
-    return metas;
+    return attachProviderPageInfo(metas, {
+      rawCount: response.items.length,
+      hasMore: response.hasMore,
+      total: response.total,
+    });
   } catch (err: any) {
     logger.error(`[MAL Discover] Error processing catalog ${catalogId}: ${err.message}`);
-    return [];
+    throw err;
   }
 }
 
@@ -508,7 +523,8 @@ async function getMalCatalog(
     return [];
   }
 
-  return await Utils.parseAnimeCatalogMetaBatch(animeResults, config, language);
+  const metas = await Utils.parseAnimeCatalogMetaBatch(animeResults, config, language);
+  return attachProviderPageInfo(metas, { rawCount: animeResults.length });
 }
 
 async function getTvmazeScheduleHandler(
@@ -536,7 +552,10 @@ async function getTvmazeScheduleHandler(
     enableErrorCaching: true,
     maxRetries: 2,
   });
-  return result.metas;
+  return attachProviderPageInfo(result.metas, {
+    rawCount: result.metas.length,
+    hasMore: result.metas.length >= pageSize ? undefined : false,
+  });
 }
 
 /**
@@ -952,7 +971,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       const apiKey = config.apiKeys?.mdblist || process.env.MDBLIST_API_KEY || process.env.BUILT_IN_MDBLIST_API_KEY || '';
       if (!apiKey) {
         logger.warn('[MDBList Discover] Missing API key');
-        return [];
+        throw Object.assign(new Error('MDBList authentication required'), { status: 401 });
       }
 
       const discoverParams = catalogConfig?.metadata?.discover?.params || {};
@@ -997,7 +1016,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       const apiKey = config.apiKeys?.mdblist || process.env.MDBLIST_API_KEY || process.env.BUILT_IN_MDBLIST_API_KEY || '';
       if (!apiKey) {
         logger.warn('[MDBList Up Next] Missing API key');
-        return [];
+        throw Object.assign(new Error('MDBList authentication required'), { status: 401 });
       }
       
       const pageSize = catalogRequestPageSize();
@@ -2094,9 +2113,7 @@ async function getTraktCatalog(
     }
 
     accessToken = await getTraktAccessToken(config, _forceTokenRefresh);
-    if (!accessToken) {
-      logger.warn(`Trakt not connected for user ${userUUID} (catalog: ${catalogId})`);
-    }
+    if (!accessToken) throw Object.assign(new Error(`Trakt authentication required for ${catalogId}`), { status: 401 });
     _forceTokenRefresh = false;
     return accessToken;
   };
@@ -2450,7 +2467,11 @@ async function getTraktCatalog(
     logger.info(`Up Next: parseTraktItems took ${parseTime}ms for ${response.items.length} items`);
     
     logger.success(`[Trakt] Processed ${metas.length} items for catalog ${catalogId} (page ${page})`);
-    return metas;
+    return attachProviderPageInfo(metas, {
+      rawCount: response.items.length,
+      hasMore: response.hasMore,
+      total: response.totalItems,
+    });
     
   } catch (err: any) {
     if (attempt === 0 && err.response?.status === 401 && config.apiKeys?.traktTokenId) {
@@ -2463,10 +2484,10 @@ async function getTraktCatalog(
     logger.error(`[Trakt] Error processing catalog ${catalogId}: ${err.message}`);
     logger.error(`Error at: ${errorLine}`);
     logger.error(`Full stack trace:`, err.stack);
-    return [];
+    throw err;
   }
   } // end retry loop
-  return [];
+  throw new Error(`[Trakt] Catalog ${catalogId} exhausted authentication retries`);
 }
 
 /**
@@ -2779,12 +2800,15 @@ async function getMalUserListCatalog(
     const validMetas = metas.filter((meta: any) => meta !== null);
 
     logger.success(`[MAL] Processed ${validMetas.length} items for catalog ${catalogId} (page ${page})`);
-    return validMetas;
+    return attachProviderPageInfo(validMetas, {
+      rawCount: response.items.length,
+      hasMore: response.hasMore,
+    });
   } catch (err: any) {
     const errorLine = err.stack?.split('\n')[1]?.trim() || 'unknown';
     logger.error(`[MAL] Error processing user list catalog ${catalogId}: ${err.message}`);
     logger.error(`Error at: ${errorLine}`);
-    return [];
+    throw err;
   }
 }
 
@@ -2860,11 +2884,15 @@ async function getLetterboxdCatalog(
     );
 
     logger.debug(`Successfully processed ${metas.length} Letterboxd items`);
-    return metas;
+    return attachProviderPageInfo(metas, {
+      rawCount: pageItems.length,
+      hasMore: endIndex < filteredItems.length,
+      total: filteredItems.length,
+    });
   } catch (error: any) {
     logger.error(`Error in getLetterboxdCatalog: ${error.message}`);
     logger.error(`Stack trace:`, error.stack);
-    return [];
+    throw error;
   }
 }
 
@@ -3096,10 +3124,10 @@ async function getMovieLensCatalog(
 
     const metas = await parseMDBListItems(mdblistShaped, 'movie', language, config, includeVideos);
     logger.info(`[MovieLens] ${catalogId} page ${page} (genre: ${genreName || 'all'}): ${metas.length} metas`);
-    return metas;
+    return attachProviderPageInfo(metas, { rawCount: windowItems.length });
   } catch (error: any) {
     logger.error(`[MovieLens] Catalog ${catalogId} failed: ${error.message}`);
-    return [];
+    throw error;
   }
 }
 
@@ -3134,13 +3162,13 @@ async function getSimklCatalog(
       const tokenId = (config.apiKeys as any)?.simklTokenId;
       if (!tokenId) {
         logger.error(`[Simkl Up Next] No Simkl token ID found`);
-        return [];
+        throw Object.assign(new Error('Simkl authentication required'), { status: 401 });
       }
       const token = await getSimklToken(tokenId);
       const accessToken = token?.access_token;
       if (!accessToken) {
         logger.error(`[Simkl Up Next] Failed to get Simkl access token`);
-        return [];
+        throw Object.assign(new Error('Simkl authentication failed'), { status: 401 });
       }
 
       const upNextStart = Date.now();
@@ -3407,14 +3435,18 @@ async function getSimklCatalog(
     logger.info(`[Simkl] parseSimklItems took ${parseTime}ms for ${response.items.length} items`);
     
     logger.success(`[Simkl] Processed ${metas.length} items for catalog ${catalogId} (page ${page})`);
-    return metas;
+    return attachProviderPageInfo(metas, {
+      rawCount: response.items.length,
+      hasMore: response.hasMore,
+      total: response.totalItems,
+    });
     
   } catch (err: any) {
     const errorLine = err.stack?.split('\n')[1]?.trim() || 'unknown';
     logger.error(`[Simkl] Error processing catalog ${catalogId}: ${err.message}`);
     logger.error(`Error at: ${errorLine}`);
     logger.error(`Full stack trace:`, err.stack);
-    return [];
+    throw err;
   }
 }
 
@@ -3429,7 +3461,7 @@ async function getFlixPatrolCatalog(
   includeVideos: boolean = false
 ): Promise<any[]> {
   try {
-    if (page > 1) return [];
+    if (page > 1) return attachProviderPageInfo([], { rawCount: 0, hasMore: false });
 
     const parts = catalogId.split('.');
     if (parts.length < 4) {
@@ -3450,13 +3482,13 @@ async function getFlixPatrolCatalog(
     let metas = await getFlixPatrolMetas(service, countrySlug, mediaType, language, config, includeVideos, variantId);
 
     logger.success(`[FlixPatrol] Processed ${metas.length} items for catalog ${catalogId}`);
-    return metas;
+    return attachProviderPageInfo(metas, { rawCount: metas.length, hasMore: undefined });
 
   } catch (err: any) {
     const errorLine = err.stack?.split('\n')[1]?.trim() || 'unknown';
     logger.error(`[FlixPatrol] Error processing catalog ${catalogId}: ${err.message}`);
     logger.error(`Error at: ${errorLine}`);
-    return [];
+    throw err;
   }
 }
 
@@ -3472,7 +3504,7 @@ async function getPublicMetaDBCatalog(
     const apiKey = config.apiKeys?.publicmetadb;
     if (!apiKey) {
       logger.warn('[PublicMetaDB] No API key configured');
-      return [];
+      throw Object.assign(new Error('PublicMetaDB authentication required'), { status: 401 });
     }
 
     const catalogConfig = config.catalogs?.find((c: any) => c.id === catalogId);
@@ -3483,7 +3515,7 @@ async function getPublicMetaDBCatalog(
       const items = await fetchResume(apiKey);
       let metas = await parseResumeItems(items, type, language, config, useShowPoster);
       logger.success(`[PublicMetaDB] Up Next: ${metas.length} items`);
-      return metas;
+      return attachProviderPageInfo(metas, { rawCount: items.length, hasMore: false });
     }
 
     if (catalogId.startsWith('publicmetadb.list.')) {
@@ -3492,7 +3524,11 @@ async function getPublicMetaDBCatalog(
       const data = await fetchListItems(apiKey, listId, page, pageSize);
       let metas = await parseListItems(data.items || [], type, language, config);
       logger.success(`[PublicMetaDB] List ${listId}: ${metas.length} items (page ${page})`);
-      return metas;
+      return attachProviderPageInfo(metas, {
+        rawCount: (data.items || []).length,
+        hasMore: data.hasMore ?? data.pagination?.hasMore,
+        total: data.totalItems ?? data.pagination?.totalItems,
+      });
     }
 
     if (catalogId.startsWith('publicmetadb.pick.')) {
@@ -3501,14 +3537,17 @@ async function getPublicMetaDBCatalog(
       const data = await fetchPickItems(apiKey, pickId, page);
       let metas = await parsePickItems(data.items || [], type, language, config);
       logger.success(`[PublicMetaDB] Pick ${pickId}: ${metas.length} items (page ${page})`);
-      return metas;
+      return attachProviderPageInfo(metas, {
+        rawCount: (data.items || []).length,
+        hasMore: data.hasMore ?? data.pagination?.hasMore,
+      });
     }
 
     logger.warn(`[PublicMetaDB] Unknown catalog: ${catalogId}`);
     return [];
   } catch (err: any) {
     logger.error(`[PublicMetaDB] Error processing catalog ${catalogId}: ${err.message}`);
-    return [];
+    throw err;
   }
 }
 
@@ -3706,7 +3745,7 @@ async function getMergedCatalog(
       return { items, rawLength: raw.length };
     } catch (err: any) {
       logger.warn(`[Merged] Source ${src.catalogId} failed: ${err.message}`);
-      return { items: [], rawLength: 0 };
+      throw err;
     }
   };
 

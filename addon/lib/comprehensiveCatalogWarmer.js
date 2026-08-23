@@ -11,6 +11,7 @@ const {
 const { fixedCatalogPageSize } = require('./catalogPageSize');
 const { buildCanonicalCatalogCacheArgs, buildCatalogQuerySignature, hydrateCanonicalPageWindow, resolveCanonicalPageWindow, writeCanonicalPages } = require('./catalogFetchPlanner');
 const { createCatalogSourceAdapter, getCatalogProviderDefinition } = require('./catalogSourceAdapter');
+const { resolveEffectiveCatalogTtl } = require('./catalogTtl');
 const { readCatalogTerminal, terminalKey, writeCatalogTerminal } = require('./catalogPagination');
 const { getGenreList } = require('./getGenreList');
 const { parseAnimeCatalogMetaBatch } = require('../utils/parseProps');
@@ -891,7 +892,7 @@ class ComprehensiveCatalogWarmer {
           const keyForPage = (page) => {
             const pageArgs = buildCanonicalCatalogCacheArgs(extraArgs || {}, page, canonicalPageSize, querySignature);
             if (catalogId.startsWith('mdblist.') && usesMdblistExternalItemsEndpoint(catalogConfig)) {
-              pageArgs._mdblistPaging = 'typed-canonical-v4';
+              pageArgs._mdblistPaging = 'typed-canonical-v5';
             }
             return `${catalogId}:${actualType}:${stableStringify(pageArgs)}`;
           };
@@ -966,7 +967,21 @@ class ComprehensiveCatalogWarmer {
             credential: catalogId.startsWith('mdblist.')
               ? (config.apiKeys?.mdblist || process.env.MDBLIST_API_KEY || process.env.BUILT_IN_MDBLIST_API_KEY || '')
               : undefined,
-            fetchPage: async page => (await fetchWarmPage(page))?.metas || [],
+            providerBatchTtl: resolveEffectiveCatalogTtl({ catalogConfig }).providerBatchTtl,
+            fetchPage: async page => {
+              const result = await fetchWarmPage(page);
+              const metas = result?.metas || [];
+              const info = metas?._providerPageInfo || result?._providerPageInfo || {};
+              return {
+                metas,
+                rawCount: Number.isInteger(info.rawCount) ? info.rawCount : metas.length,
+                entries: info.entries,
+                resumeAfterBatch: info.resumeAfterBatch,
+                exhaustion: info.exhaustion,
+                hasMore: info.hasMore,
+                total: info.total,
+              };
+            },
             fetchOffsetBatch: async (resumeState, requestedRawCount) => {
               if (resumeState.kind !== 'offset') throw new Error(`Offset adapter received ${resumeState.kind} resume state`);
               const { fetchCatalogBatch } = require('./getCatalog');
@@ -995,11 +1010,13 @@ class ComprehensiveCatalogWarmer {
               };
             },
           });
+          const catalogTtlPolicy = resolveEffectiveCatalogTtl({ catalogConfig });
           const result = await hydrateCanonicalPageWindow({
             window,
             adapter: sourceAdapter,
             readPage: page => readCatalogCache(uuid, keyForPage(page), {
               config,
+              effectiveCatalogTtl: catalogTtlPolicy.canonicalPageTtl,
               onHit: () => {
                 this.stats.pagesFromCache++;
                 if (this.stats.uuidStats[uuid]) this.stats.uuidStats[uuid].pagesFromCache++;
@@ -1009,16 +1026,18 @@ class ComprehensiveCatalogWarmer {
               enableErrorCaching: false,
               maxRetries: 1,
               config,
+              effectiveCatalogTtl: catalogTtlPolicy.canonicalPageTtl,
             }),
             writePages: pages => writeCanonicalPages(pages, (page, value) =>
               cacheWrapCatalog(uuid, keyForPage(page), async () => value, {
                 enableErrorCaching: false,
                 maxRetries: 1,
                 config,
+                effectiveCatalogTtl: catalogTtlPolicy.canonicalPageTtl,
               })
             ),
-            readTerminal: () => readCatalogTerminal(catalogTerminalKey),
-            writeTerminal: state => writeCatalogTerminal(catalogTerminalKey, state),
+            readTerminal: () => readCatalogTerminal(catalogTerminalKey, catalogTtlPolicy.terminalTtl),
+            writeTerminal: state => writeCatalogTerminal(catalogTerminalKey, state, catalogTtlPolicy.terminalTtl),
           });
 
           const resultMetas = window.pages.flatMap(page => result.pages.get(page)?.metas || []);

@@ -531,7 +531,7 @@ async function jikanGetAllPages(endpoint: string, initialParams: Record<string, 
           .then((response: any) => response.data?.data || [])
           .catch((error: any) => {
             logger.warn(`Failed to fetch page ${page} for endpoint ${endpoint}:`, error.message || error);
-            return [];
+            throw error;
           })
       );
     }
@@ -542,6 +542,7 @@ async function jikanGetAllPages(endpoint: string, initialParams: Record<string, 
     }
   } catch (error: any) {
     logger.warn(`Failed to fetch first page for endpoint ${endpoint}:`, error.message || error);
+    throw error;
   }
 
   return allItems;
@@ -564,7 +565,7 @@ async function getAiringSchedule(day: string, page: number = 1, config: any = {}
     .then((response: any) => normalizeJikanCatalogForCache(response.data?.data || []))
     .catch((e: any) => {
       logger.warn(`Could not fetch airing schedule for ${day}, page ${page}:`, e.message);
-      return [];
+      throw e;
     });
 }
 
@@ -582,7 +583,7 @@ async function getAiringNow(page: number = 1, config: any = {}): Promise<any[]> 
     .then((response: any) => normalizeJikanCatalogForCache(response.data?.data || []))
     .catch((e: any) => {
       logger.warn(`Could not fetch currently airing anime, page ${page}:`, e.message);
-      return [];
+      throw e;
     });
 }
 
@@ -601,7 +602,7 @@ async function getUpcoming(page: number = 1, config: any = {}): Promise<any[]> {
     .then((response: any) => normalizeJikanCatalogForCache(response.data?.data || []))
     .catch((e: any) => {
       logger.warn(`Could not fetch upcoming anime , page ${page}:`, e.message);
-      return [];
+      throw e;
     });
 }
 
@@ -634,7 +635,7 @@ async function getAnimeByGenre(genreId: number | string, typeFilter: string | nu
 
   } catch (error: any) {
     logger.error(`Jikan API Error: Could not fetch anime for genre ID ${genreId}, page ${page}. URL: ${url}`, error.message);
-    return [];
+    throw error;
   }
 }
 
@@ -644,7 +645,7 @@ async function getAnimeGenres(): Promise<any[]> {
     .then((response: any) => response.data?.data || [])
     .catch((e: any) => {
       logger.error(`Could not fetch anime genres from Jikan`, e.message);
-      return [];
+      throw e;
     });
 }
 
@@ -672,7 +673,7 @@ async function getTopAnimeByDateRange(startDate: string, endDate: string, page: 
     .then((response: any) => normalizeJikanCatalogForCache(response.data?.data || []))
     .catch((e: any) => {
       logger.warn(`Could not fetch top anime between ${startDate} and ${endDate}, page ${page}:`, e.message);
-      return [];
+      throw e;
   });
 }
 
@@ -695,7 +696,7 @@ async function getTopAnimeByType(type: string, page: number = 1, config: any = {
     .then((response: any) => normalizeJikanCatalogForCache(response.data?.data || []))
     .catch((e: any) => {
       logger.warn(`Could not fetch top  anime, page ${page}:`, e.message);
-      return [];
+      throw e;
     });
 }
 
@@ -715,7 +716,7 @@ async function getTopAnimeByFilter(filter: string, page: number = 1, config: any
     .then((response: any) => normalizeJikanCatalogForCache(response.data?.data || []))
     .catch((e: any) => {
       logger.warn(`Could not fetch top anime by filter ${filter}, page ${page}:`, e.message);
-      return [];
+      throw e;
     });
 }
 
@@ -734,7 +735,7 @@ async function getAnimeByStudio(studioId: string | number, page: number = 1, lim
     .then((response: any) => normalizeJikanCatalogForCache(response.data?.data || []))
     .catch((e: any) => {
       logger.warn(`Could not fetch anime for studio ID ${studioId}:`, e.message);
-      return [];
+      throw e;
     });
 }
 
@@ -748,7 +749,7 @@ async function getAnimeBySeason(year: number, season: string, page: number = 1, 
     .then((response: any) => normalizeJikanCatalogForCache(response.data?.data || []))
     .catch((e: any) => {
       logger.warn(`Could not fetch anime for ${season} ${year}, page ${page}:`, e.message);
-      return [];
+      throw e;
     });
 }
 
@@ -758,7 +759,7 @@ async function getAvailableSeasons(): Promise<any[]> {
     .then((response: any) => response.data?.data || [])
     .catch((e: any) => {
       logger.error(`Could not fetch available seasons:`, e.message);
-      return [];
+      throw e;
     });
 }
 

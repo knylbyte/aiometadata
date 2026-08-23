@@ -11,8 +11,8 @@ export interface CatalogCursor {
   sourceResume?: ProviderResumeState;
 }
 
-const CURSOR_PREFIX = 'catalog-cursor:v4';
-const TERMINAL_PREFIX = 'canonical-terminal:v4';
+const CURSOR_PREFIX = 'catalog-cursor:v5';
+const TERMINAL_PREFIX = 'canonical-terminal:v5';
 
 function segment(value: unknown): string {
   return encodeURIComponent(String(value ?? ''));
@@ -54,22 +54,27 @@ export async function clearCursor(key: string): Promise<void> {
   if (redis) await redis.del(key);
 }
 
-export async function readCatalogTerminal(key: string): Promise<CanonicalTerminalState | null> {
-  if (!redis) return null;
+export async function readCatalogTerminal(key: string, ttl?: number): Promise<CanonicalTerminalState | null> {
+  if (!redis || ttl === 0) return null;
   const raw = await redis.get(key);
   if (!raw) return null;
   try {
-    return JSON.parse(raw) as CanonicalTerminalState;
+    const value = JSON.parse(raw) as CanonicalTerminalState;
+    if (Number.isFinite(ttl) && ttl! > 0 && typeof (redis as any).expire === 'function') {
+      await (redis as any).expire(key, Math.floor(ttl!));
+    }
+    return value;
   } catch {
     await redis.del(key);
     return null;
   }
 }
 
-export async function writeCatalogTerminal(key: string, state: CanonicalTerminalState): Promise<void> {
+export async function writeCatalogTerminal(key: string, state: CanonicalTerminalState, ttlOverride?: number): Promise<void> {
   if (!redis) return;
-  const ttl = Math.max(60, parseInt(process.env.CATALOG_TTL || '86400', 10) || 86400);
-  await redis.set(key, JSON.stringify(state), 'EX', ttl);
+  const ttl = ttlOverride ?? (parseInt(process.env.CATALOG_TTL || '86400', 10) || 86400);
+  if (!Number.isFinite(ttl) || ttl <= 0) return;
+  await redis.set(key, JSON.stringify(state), 'EX', Math.max(1, Math.floor(ttl)));
 }
 
 export async function resolveStartPage(

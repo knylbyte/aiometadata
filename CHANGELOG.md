@@ -2,9 +2,10 @@
 
 ## Unreleased
 
-- Catalog pagination now uses `canonical-v4` pages with exact offset/page-index/cursor resume states, `catalog-cursor:v4` history keys, and `canonical-terminal:v4` end markers.
-- Runtime and warmup share `provider-batch:v1` raw batches with in-process single-flight. Provider errors and unknown exhaustion never create terminal or partial canonical pages.
-- MDBList raw item caches move from v3 to v4 because their pagination payload now distinguishes missing `x-has-more` headers from an explicit end. Older catalog, cursor, and MDBList paging keys are not read and expire naturally; unrelated metadata, mapping, genre, poster, TMDB, and TVDB caches remain valid.
+- Catalog pagination now uses `canonical-v5` pages with exact offset/page-index/cursor resume states, `catalog-cursor:v5` history keys, and `canonical-terminal:v5` end markers. Unknown partial results are returned transiently with an exact cursor instead of being persisted or turned into HTTP 500 after progress.
+- Runtime and warmup share `provider-batch:v2` batches through a structured provider contract and in-process single-flight. Provider errors are thrown, Trakt Recommendations declares its native 50-item geometry, and fixed-page EOF rules are adapter-specific.
+- MDBList raw item caches move to v5 because split payloads now retain the complete consumed raw count and External List/Watchlist type filters are sent upstream. Old v4/v1 paging keys are not read and expire naturally; unrelated metadata, mapping, genre, poster, TMDB, and TVDB caches remain valid.
+- Canonical pages, provider batches, and terminal markers share one effective per-catalog TTL policy. TTL no longer changes catalog content keys; a TTL of zero disables persistent paging caches without disabling concurrent-request single-flight.
 - `META_CONCURRENCY=0` now selects a safe automatic concurrency of 20 instead of unbounded metadata reconstruction.
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.

@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
 import { cacheWrapGlobal } from './getCache';
 import type { ProviderBatchResult, ProviderResumeState } from './catalogFetchPlanner';
-import { stableCatalogStringify } from './catalogFetchPlanner';
+import { isProviderResumeState, stableCatalogStringify } from './catalogFetchPlanner';
 
-export const PROVIDER_BATCH_CACHE_VERSION = 'provider-batch:v1';
+export const PROVIDER_BATCH_CACHE_VERSION = 'provider-batch:v2';
 
 interface MemoryEntry {
   expiresAt: number;
@@ -55,25 +55,34 @@ export async function fetchProviderBatchCached(input: {
   useRedis?: boolean;
 }): Promise<ProviderBatchResult> {
   const key = providerBatchCacheKey(input);
-  const ttl = Math.max(1, input.ttl || parseInt(process.env.CATALOG_PROVIDER_BATCH_TTL || '300', 10) || 300);
-  if (!input.bypass) {
+  const configuredTtl = input.ttl ?? (parseInt(process.env.CATALOG_PROVIDER_BATCH_TTL || '300', 10) || 300);
+  const ttl = Math.max(0, configuredTtl);
+  const persistent = ttl > 0;
+  if (!input.bypass && persistent) {
     const local = memory.get(key);
     if (local && local.expiresAt > Date.now()) return local.value;
     if (local) memory.delete(key);
+  }
+  if (!input.bypass) {
     const pending = inFlight.get(key);
     if (pending) return pending;
   }
 
   const load = async () => {
-    const result = input.useRedis === false
+    const result = input.useRedis === false || !persistent
       ? await input.loader()
       : await cacheWrapGlobal(key, input.loader, ttl, {
           upstream: true,
           enableErrorCaching: false,
           maxRetries: 0,
         });
-    if (!result || !Array.isArray(result.entries)) throw new Error('Invalid provider batch result');
-    if (!input.bypass) remember(key, result, ttl);
+    if (!result || !Array.isArray(result.entries)
+      || !Number.isInteger(result.rawCount) || result.rawCount < 0
+      || !isProviderResumeState(result.resumeAfterBatch)
+      || !['confirmed', 'not-exhausted', 'unknown'].includes(result.exhaustion)) {
+      throw new Error('Invalid provider batch result');
+    }
+    if (!input.bypass && persistent) remember(key, result, ttl);
     return result;
   };
   if (input.bypass) return load();

@@ -308,7 +308,7 @@ async function makeRateLimitedRequest<T>(
   throw new Error(`[${context}] All ${retries} attempts failed.`);
 }
 
-async function fetchMDBListItems(listId: string, apiKey: string, language: string, page: number, sort?: string, order?: string, genre?: string, unified?: boolean, catalogType?: string, cacheTTL?: number, filterScoreMin?: number, filterScoreMax?: number, mediaTypeFilter?: string, pageSizeOverride?: number, offsetOverride?: number, bypassCache: boolean = false): Promise<{items: any[], totalItems?: number, hasMore?: boolean, totalPages?: number, exhaustion: CatalogExhaustion}> {
+async function fetchMDBListItems(listId: string, apiKey: string, language: string, page: number, sort?: string, order?: string, genre?: string, unified?: boolean, catalogType?: string, cacheTTL?: number, filterScoreMin?: number, filterScoreMax?: number, mediaTypeFilter?: string, pageSizeOverride?: number, offsetOverride?: number, bypassCache: boolean = false): Promise<{items: any[], rawCount: number, totalItems?: number, hasMore?: boolean, totalPages?: number, exhaustion: CatalogExhaustion}> {
   const pageSize = Math.min(100, Math.max(1, pageSizeOverride || parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20));
   const offset = Number.isInteger(offsetOverride) && offsetOverride! >= 0
     ? offsetOverride!
@@ -318,8 +318,7 @@ async function fetchMDBListItems(listId: string, apiKey: string, language: strin
     ? crypto.createHash('sha256').update(apiKey).digest('hex').substring(0, 16)
     : 'shared';
 
-  const ttlSegment = cacheTTL !== undefined ? `:ttl:${cacheTTL}` : '';
-  const cacheKey = `mdblist-api:items:v4:${keyScope}:${listId}:offset:${offset}:limit:${pageSize}:${sort || ''}:${order || ''}:${genre || ''}:${unified !== false}:${catalogType || ''}:${filterScoreMin ?? ''}:${filterScoreMax ?? ''}:${mediaTypeFilter || ''}${ttlSegment}`;
+  const cacheKey = `mdblist-api:items:v5:${keyScope}:${listId}:offset:${offset}:limit:${pageSize}:${sort || ''}:${order || ''}:${genre || ''}:${unified !== false}:${catalogType || ''}:${filterScoreMin ?? ''}:${filterScoreMax ?? ''}:${mediaTypeFilter || ''}`;
 
   const ttl = cacheTTL !== undefined ? cacheTTL : parseInt(process.env.CATALOG_TTL || String(1 * 24 * 60 * 60), 10);
 
@@ -379,32 +378,9 @@ async function fetchMDBListItems(listId: string, apiKey: string, language: strin
         totalPages = totalItems ? Math.ceil(totalItems / pageSize) : undefined;
       }
       
-      let items: any[];
-      
-      const hasMoviesShowsStructure = response.data && 
-                                      typeof response.data === 'object' && 
-                                      !Array.isArray(response.data) &&
-                                      ('movies' in response.data || 'shows' in response.data);
-      
-      if (hasMoviesShowsStructure) {
-        if (catalogType === 'series') {
-          items = response.data.shows || [];
-        } else if (catalogType === 'movie') {
-          items = response.data.movies || [];
-        } else {
-          items = [
-            ...(response.data?.movies || []),
-            ...(response.data?.shows || [])
-          ];
-        }
-      } else if (Array.isArray(response.data)) {
-        items = response.data;
-      } else {
-        items = [
-          ...(response.data?.movies || []),
-          ...(response.data?.shows || [])
-        ];
-      }
+      const selected = selectMDBListResponseItems(response.data, catalogType);
+      const items = selected.items;
+      const rawCount = selected.rawCount;
       
       // Smart pagination validation and logging
       if (listId === 'watchlist') {
@@ -414,6 +390,7 @@ async function fetchMDBListItems(listId: string, apiKey: string, language: strin
           logger.warn(`Requested offset ${offset} exceeds total items ${totalItems} for list ${listId}`);
           return { 
             items: [], 
+            rawCount: 0,
             totalItems, 
             hasMore: false,
             totalPages,
@@ -443,13 +420,14 @@ async function fetchMDBListItems(listId: string, apiKey: string, language: strin
       
       return {
         items,
+        rawCount,
         totalItems,
         hasMore,
         totalPages,
-        exhaustion: resolveMDBListExhaustion(hasMoreHeader, totalItems, offset, items.length),
+        exhaustion: resolveMDBListExhaustion(hasMoreHeader, totalItems, offset, rawCount),
       };
     };
-    return bypassCache ? await fetchItems() : await cacheWrapGlobal(cacheKey, fetchItems, ttl, { upstream: true });
+    return bypassCache || ttl <= 0 ? await fetchItems() : await cacheWrapGlobal(cacheKey, fetchItems, ttl, { upstream: true });
   } catch (err: any) {
     logger.error(`Error retrieving items for list ${listId}, page ${page}:`, err.message);
     throw err;
@@ -635,6 +613,21 @@ const MDBLIST_API_HOST = 'api.mdblist.com';
 const MDBLIST_BY_NAME_ITEMS_PATH_PATTERN = /^(\/lists\/[^/]+\/[^/]+\/items)(?:\/(?:movie|show))?\/?$/;
 const MDBLIST_EXTERNAL_ITEMS_PATH_PATTERN = /^\/external\/lists\/[^/]+\/items\/?$/;
 
+function selectMDBListResponseItems(data: any, catalogType?: string): { items: any[]; rawCount: number; split: boolean } {
+  const split = !!data && typeof data === 'object' && !Array.isArray(data)
+    && ('movies' in data || 'shows' in data);
+  if (!split) {
+    const items = Array.isArray(data) ? data : [];
+    return { items, rawCount: items.length, split: false };
+  }
+  const movies = Array.isArray(data.movies) ? data.movies : [];
+  const shows = Array.isArray(data.shows) ? data.shows : [];
+  const rawCount = movies.length + shows.length;
+  if (catalogType === 'movie') return { items: movies, rawCount, split: true };
+  if (catalogType === 'series') return { items: shows, rawCount, split: true };
+  return { items: [...movies, ...shows], rawCount, split: true };
+}
+
 function resolveMDBListExhaustion(
   hasMoreHeader: unknown,
   totalItems: number | undefined,
@@ -708,7 +701,7 @@ async function fetchMDBListExternalItems(
   pageSizeOverride?: number,
   offsetOverride?: number,
   bypassCache: boolean = false
-): Promise<{items: any[], totalItems?: number, hasMore?: boolean, totalPages?: number, exhaustion: CatalogExhaustion}> {
+): Promise<{items: any[], rawCount: number, totalItems?: number, hasMore?: boolean, totalPages?: number, exhaustion: CatalogExhaustion}> {
   const pageSize = Math.min(100, Math.max(1, pageSizeOverride || parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20));
   const offset = Number.isInteger(offsetOverride) && offsetOverride! >= 0
     ? offsetOverride!
@@ -727,10 +720,10 @@ async function fetchMDBListExternalItems(
   normalizedUrl.searchParams.delete('filter_genre');
   normalizedUrl.searchParams.delete('filter_score_min');
   normalizedUrl.searchParams.delete('filter_score_max');
+  normalizedUrl.searchParams.delete('mediatype');
   const urlBase = normalizedUrl.toString();
 
-  const ttlSegment = cacheTTL !== undefined ? `:ttl:${cacheTTL}` : '';
-  const cacheKey = `mdblist-api:external:v4:shared:${urlBase}:offset:${offset}:limit:${pageSize}:${sort || ''}:${order || ''}:${genre || ''}:${catalogType || ''}:${unified !== false}:${filterScoreMin ?? ''}:${filterScoreMax ?? ''}${ttlSegment}`;
+  const cacheKey = `mdblist-api:external:v5:shared:${urlBase}:offset:${offset}:limit:${pageSize}:${sort || ''}:${order || ''}:${genre || ''}:${catalogType || ''}:${unified !== false}:${filterScoreMin ?? ''}:${filterScoreMax ?? ''}`;
 
   const ttl = cacheTTL !== undefined ? cacheTTL : parseInt(process.env.CATALOG_TTL || String(1 * 24 * 60 * 60), 10);
 
@@ -758,6 +751,10 @@ async function fetchMDBListExternalItems(
       if (typeof filterScoreMax === 'number') {
         urlWithParams.searchParams.set('filter_score_max', String(filterScoreMax));
       }
+      if (MDBLIST_EXTERNAL_ITEMS_PATH_PATTERN.test(urlWithParams.pathname)) {
+        if (catalogType === 'movie') urlWithParams.searchParams.set('mediatype', 'movie');
+        if (catalogType === 'series') urlWithParams.searchParams.set('mediatype', 'show');
+      }
 
       const fullUrl = urlWithParams.toString();
 
@@ -772,40 +769,18 @@ async function fetchMDBListExternalItems(
       const hasMoreHeader = response.headers?.['x-has-more'];
       const hasMore = hasMoreHeader === undefined ? undefined : String(hasMoreHeader).toLowerCase() === 'true';
 
-      let items: any[];
-
-      const hasMoviesShowsStructure = response.data && 
-                                      typeof response.data === 'object' && 
-                                      !Array.isArray(response.data) &&
-                                      ('movies' in response.data || 'shows' in response.data);
-      
-      if (hasMoviesShowsStructure) {
-        if (catalogType === 'series') {
-          items = response.data.shows || [];
-        } else if (catalogType === 'movie') {
-          items = response.data.movies || [];
-        } else {
-          items = [
-            ...(response.data?.movies || []),
-            ...(response.data?.shows || [])
-          ];
-        }
-      } else if (Array.isArray(response.data)) {
-        items = response.data;
-      } else {
-        items = [
-          ...(response.data?.movies || []),
-          ...(response.data?.shows || [])
-        ];
-      }
+      const selected = selectMDBListResponseItems(response.data, catalogType);
+      const items = selected.items;
+      const rawCount = selected.rawCount;
 
       return {
         items,
+        rawCount,
         hasMore,
-        exhaustion: resolveMDBListExhaustion(hasMoreHeader, undefined, offset, items.length),
+        exhaustion: resolveMDBListExhaustion(hasMoreHeader, undefined, offset, rawCount),
       };
     };
-    return bypassCache ? await fetchItems() : await cacheWrapGlobal(cacheKey, fetchItems, ttl, { upstream: true });
+    return bypassCache || ttl <= 0 ? await fetchItems() : await cacheWrapGlobal(cacheKey, fetchItems, ttl, { upstream: true });
   } catch (err: any) {
       logger.error(`Error retrieving items from URL ${sanitizeUrlForLogging(effectiveUrl)}, page ${page}:`, err.message);
     throw err;
@@ -1786,6 +1761,7 @@ async function fetchMDBListCatalog(
 export {
   fetchMDBListItems,
   fetchMDBListExternalItems,
+  selectMDBListResponseItems,
   normalizeMDBListByNameItemsUrl,
   usesMdblistExternalItemsEndpoint,
   supportsMdblistScoreFilters,

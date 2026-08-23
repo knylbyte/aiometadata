@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
-export const CATALOG_CANONICAL_CACHE_VERSION = 'canonical-v4';
-export const CATALOG_CANONICAL_PAGE_SCHEMA = 'v4';
+export const CATALOG_CANONICAL_CACHE_VERSION = 'canonical-v5';
+export const CATALOG_CANONICAL_PAGE_SCHEMA = 'v5';
 
 export type CatalogExhaustion = 'confirmed' | 'not-exhausted' | 'unknown';
 
@@ -31,6 +31,9 @@ export interface CatalogProviderCapabilities {
   nativePageSize?: number;
   cursorBased: boolean;
   stableOrdering: boolean;
+  paginationModel?: 'offset' | 'page' | 'cursor';
+  emptyPageConfirmsEnd?: boolean;
+  shortPageConfirmsEnd?: boolean;
 }
 
 export interface CatalogFetchBatch {
@@ -74,17 +77,18 @@ export interface MissingPageRange {
 export interface CanonicalCatalogPage {
   metas: any[];
   _canonical: {
-    schema: 'v4';
+    schema: 'v5';
     page: number;
     sourceStart: ProviderResumeState;
     sourceNext: ProviderResumeState;
     exhausted: boolean;
     entryResumes: ProviderResumeState[];
+    transient?: boolean;
   };
 }
 
 export interface CanonicalTerminalState {
-  schema: 'v4';
+  schema: 'v5';
   sourceEnd: ProviderResumeState;
   lastCanonicalPage: number;
 }
@@ -100,12 +104,13 @@ function positiveInteger(value: number, fallback: number): number {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
-function stableValue(value: any): any {
-  if (Array.isArray(value)) return value.map(stableValue);
+function stableValue(value: any, omitCachePolicy: boolean = false): any {
+  if (Array.isArray(value)) return value.map(child => stableValue(child, omitCachePolicy));
   if (value && typeof value === 'object') {
     return Object.keys(value).sort().reduce((result: Record<string, any>, key) => {
+      if (omitCachePolicy && key === 'cacheTTL') return result;
       const child = value[key];
-      if (child !== undefined && typeof child !== 'function') result[key] = stableValue(child);
+      if (child !== undefined && typeof child !== 'function') result[key] = stableValue(child, omitCachePolicy);
       return result;
     }, {});
   }
@@ -143,7 +148,7 @@ export function buildCatalogQuerySignature(input: {
     language: input.language || '',
     canonicalPageSize: positiveInteger(input.canonicalPageSize, 20),
     args,
-    catalogConfig: input.catalogConfig || null,
+    catalogConfig: input.catalogConfig ? stableValue(input.catalogConfig, true) : null,
     configFingerprint: input.configFingerprint || null,
   };
   return createHash('sha256').update(stableCatalogStringify(payload)).digest('hex').slice(0, 32);
@@ -304,7 +309,7 @@ export async function writeCanonicalPages(
   writePage: (page: number, value: CanonicalCatalogPage) => Promise<CanonicalCatalogPage | void>
 ): Promise<Map<number, CanonicalCatalogPage>> {
   const written = new Map<number, CanonicalCatalogPage>();
-  await Promise.all([...pages.entries()].sort(([a], [b]) => a - b).map(async ([page, value]) => {
+  await Promise.all([...pages.entries()].filter(([, value]) => !value._canonical.transient).sort(([a], [b]) => a - b).map(async ([page, value]) => {
     const stored = await writePage(page, value);
     written.set(page, stored || value);
   }));
@@ -332,38 +337,27 @@ function requestForResume(
 
 export function createSequentialPageBatchFetcher(
   capabilities: CatalogProviderCapabilities,
-  fetchPage: (page: number) => Promise<any[] | {
-    items?: any[];
-    metas?: any[];
-    entries?: ReconstructedCatalogEntry[];
-    rawCount?: number;
-    exhaustion?: CatalogExhaustion;
-    resumeAfterBatch?: ProviderResumeState;
-  }>
+  fetchPage: (page: number) => Promise<ProviderBatchResult>
 ): (request: CatalogFetchBatch) => Promise<ProviderBatchResult> {
-  const nativePageSize = positiveInteger(capabilities.nativePageSize || capabilities.maxLimit, 20);
   return async (request: CatalogFetchBatch): Promise<ProviderBatchResult> => {
     const resume = request.resumeState.kind === 'page-index'
       ? request.resumeState
       : { kind: 'page-index' as const, page: request.providerPage || 1, index: request.pageOffset || 0 };
     const rawResult: any = await fetchPage(resume.page);
-    const items = Array.isArray(rawResult) ? rawResult : (rawResult?.metas || rawResult?.items || []);
-    const info = (items as any)._providerPageInfo || rawResult?._providerPageInfo || rawResult || {};
+    if (!rawResult || Array.isArray(rawResult) || !Array.isArray(rawResult.entries)
+      || !Number.isInteger(rawResult.rawCount) || rawResult.rawCount < 0) {
+      throw new Error('Fixed-page provider must return a structured ProviderBatchResult');
+    }
+    const info = rawResult;
     const allEntries: ReconstructedCatalogEntry[] = Array.isArray(info.entries)
       ? info.entries
-      : items.map((meta: any, index: number) => ({
-          meta,
-          sourcePosition: { kind: 'page-index', page: resume.page, index },
-          resumeAfter: index + 1 >= nativePageSize
-            ? { kind: 'page-index', page: resume.page + 1, index: 0 }
-            : { kind: 'page-index', page: resume.page, index: index + 1 },
-        }));
+      : [];
     const entries = allEntries.filter(entry => {
       return entry.sourcePosition.kind !== 'page-index'
         || entry.sourcePosition.page > resume.page
         || (entry.sourcePosition.page === resume.page && entry.sourcePosition.index >= resume.index);
     });
-    const rawCount = Math.max(0, Number(info.rawCount ?? items.length) - resume.index);
+    const rawCount = Math.max(0, Number(info.rawCount) - resume.index);
     const resumeAfterBatch = isProviderResumeState(info.resumeAfterBatch)
       ? info.resumeAfterBatch
       : { kind: 'page-index' as const, page: resume.page + 1, index: 0 };
@@ -427,6 +421,7 @@ export async function hydrateCanonicalPageWindow(options: {
   fetchBatch?: (request: CatalogFetchBatch) => Promise<ProviderBatchResult>;
   readTerminal?: () => Promise<CanonicalTerminalState | null>;
   writeTerminal?: (terminal: CanonicalTerminalState) => Promise<void>;
+  sourceAnchor?: { canonicalPage: number; resumeState: ProviderResumeState };
   dedupeKey?: (meta: any) => string | null | undefined;
   acceptEntry?: (entry: ReconstructedCatalogEntry) => Promise<boolean> | boolean;
   maxBatches?: number;
@@ -434,6 +429,7 @@ export async function hydrateCanonicalPageWindow(options: {
   pages: Map<number, CanonicalCatalogPage>;
   fetchedBatches: CatalogFetchBatch[];
   writtenPages: number[];
+  transientPages: number[];
   exhausted: boolean;
   terminal: CanonicalTerminalState | null;
 }> {
@@ -448,6 +444,7 @@ export async function hydrateCanonicalPageWindow(options: {
   const loaded = new Map<number, CanonicalCatalogPage | null>();
   const fetchedBatches: CatalogFetchBatch[] = [];
   const writtenPages: number[] = [];
+  const transientPages: number[] = [];
   let terminal = options.readTerminal ? await options.readTerminal() : null;
   if (terminal?.schema !== CATALOG_CANONICAL_PAGE_SCHEMA || !isProviderResumeState(terminal.sourceEnd)) terminal = null;
 
@@ -462,13 +459,17 @@ export async function hydrateCanonicalPageWindow(options: {
 
   await Promise.all(window.pages.map(loadPage));
   if (terminal && terminal.lastCanonicalPage < window.startPage) {
-    return { pages, fetchedBatches, writtenPages, exhausted: true, terminal };
+    return { pages, fetchedBatches, writtenPages, transientPages, exhausted: true, terminal };
   }
 
   const ranges = planMissingPageRanges(window.pages, pages.keys(), window.canonicalPageSize);
   for (const range of ranges) {
     if (terminal && range.startPage > terminal.lastCanonicalPage) break;
-    const anchor = await trustedAnchor({ startPage: range.startPage, initialResumeState, loadPage, dedupeKey });
+    let anchor = await trustedAnchor({ startPage: range.startPage, initialResumeState, loadPage, dedupeKey });
+    if (anchor.page === 0 && options.sourceAnchor?.canonicalPage === range.startPage - 1
+      && isProviderResumeState(options.sourceAnchor.resumeState)) {
+      anchor = { page: options.sourceAnchor.canonicalPage, resume: options.sourceAnchor.resumeState, seen: new Set() };
+    }
     let currentPage = anchor.page + 1;
     const targetEndPage = terminal
       ? Math.min(range.endPage, terminal.lastCanonicalPage)
@@ -483,6 +484,7 @@ export async function hydrateCanonicalPageWindow(options: {
       exhaustion: CatalogExhaustion;
     } | null = null;
     let terminalReached = false;
+    let transientRange = false;
     let batchesRead = 0;
     const maxBatches = options.maxBatches ?? 100;
 
@@ -493,6 +495,7 @@ export async function hydrateCanonicalPageWindow(options: {
       }
       const sourceStart = currentResume;
       const accepted: ReconstructedCatalogEntry[] = [];
+      let transientStop = false;
 
       while (accepted.length < window.canonicalPageSize && !terminalReached) {
         if (carry && carry.index < carry.entries.length) {
@@ -526,6 +529,10 @@ export async function hydrateCanonicalPageWindow(options: {
         }
 
         if (batchesRead >= maxBatches) {
+          if (accepted.length > 0) {
+            transientStop = true;
+            break;
+          }
           throw new CatalogProviderNoProgressError(`Provider did not fill canonical page ${currentPage} within ${maxBatches} batches`);
         }
         const remaining = ((targetEndPage - currentPage) * window.canonicalPageSize)
@@ -543,6 +550,10 @@ export async function hydrateCanonicalPageWindow(options: {
         }
         if (!result.entries.length && result.exhaustion !== 'confirmed'
           && resumeStatesEqual(currentResume, result.resumeAfterBatch)) {
+          if (accepted.length > 0) {
+            transientStop = true;
+            break;
+          }
           throw new CatalogProviderNoProgressError(`Provider returned an empty ${result.exhaustion} batch without progress`);
         }
         carry = {
@@ -551,6 +562,26 @@ export async function hydrateCanonicalPageWindow(options: {
           resumeAfterBatch: result.resumeAfterBatch,
           exhaustion: result.exhaustion,
         };
+      }
+
+      if (transientStop && accepted.length > 0) {
+        const transientPage: CanonicalCatalogPage = {
+          metas: accepted.map(entry => entry.meta),
+          _canonical: {
+            schema: CATALOG_CANONICAL_PAGE_SCHEMA,
+            page: currentPage,
+            sourceStart,
+            sourceNext: currentResume,
+            exhausted: false,
+            entryResumes: accepted.map(entry => entry.resumeAfter),
+            transient: true,
+          },
+        };
+        pages.set(currentPage, transientPage);
+        loaded.set(currentPage, transientPage);
+        transientPages.push(currentPage);
+        transientRange = true;
+        break;
       }
 
       if (accepted.length === window.canonicalPageSize && carry
@@ -590,6 +621,8 @@ export async function hydrateCanonicalPageWindow(options: {
       writtenPages.push(page);
     }
 
+    if (transientRange) break;
+
     if (terminalReached) {
       const lastCanonicalPage = staged.size
         ? Math.max(...staged.keys())
@@ -604,7 +637,7 @@ export async function hydrateCanonicalPageWindow(options: {
     }
   }
 
-  return { pages, fetchedBatches, writtenPages, exhausted: !!terminal, terminal };
+  return { pages, fetchedBatches, writtenPages, transientPages, exhausted: !!terminal, terminal };
 }
 
 export async function resumeStateForCanonicalPosition(

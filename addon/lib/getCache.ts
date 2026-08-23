@@ -1435,26 +1435,31 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
     cacheLogger.debug(`[Catalog] Skipping outer cache for merged catalog ${idOnly} (sources cache internally)`);
   }
 
+  if (options.effectiveCatalogTtl !== undefined) {
+    cacheTTL = Math.max(0, Number(options.effectiveCatalogTtl) || 0);
+    cachingDisabled = cacheTTL === 0;
+  }
+
   let key: string;
   if (isAuthCatalog) {
     const sessionId = config.sessionId || '';
-    key = `catalog:${sessionId}:${configHash}:${cacheTTL}:${catalogKey}`;
+    key = `catalog:${sessionId}:${configHash}:${catalogKey}`;
   } else if (isAiringTodayCatalog) {
     const now = new Date();
     const year = now.getFullYear();
     const month = String(now.getMonth() + 1).padStart(2, '0');
     const day = String(now.getDate()).padStart(2, '0');
     const today = `${year}-${month}-${day}`;
-    key = `catalog:${today}:${configHash}:${cacheTTL}:${catalogKey}`;
+    key = `catalog:${today}:${configHash}:${catalogKey}`;
   } else if (idOnly.includes('stremthru.') || idOnly.startsWith('custom.') || idOnly.startsWith('letterboxd.')) {
-    key = `catalog:${userUUID}:${configHash}:${cacheTTL}:${catalogKey}`;
+    key = `catalog:${userUUID}:${configHash}:${catalogKey}`;
   } else {
-    key = `catalog:${configHash}:${cacheTTL}:${catalogKey}`;
+    key = `catalog:${configHash}:${catalogKey}`;
   }
 
   const isUserScopedCatalog = isAuthCatalog || idOnly.includes('stremthru.') || idOnly.startsWith('custom.') || idOnly.startsWith('letterboxd.');
   const cacheKeyIdentifier = isAuthCatalog ? (config.sessionId || 'no-session') : (isUserScopedCatalog ? (userUUID || '') : '');
-  const catalogSig = shortSignature(`${cacheKeyIdentifier}|${idOnly}|${configHash}|ttl:${cacheTTL}`);
+  const catalogSig = shortSignature(`${cacheKeyIdentifier}|${idOnly}|${configHash}`);
   cacheLogger.debug(`[Catalog] Key detail (${idOnly}) [sig:${catalogSig}] scope:${contentScope} userScoped:${isUserScopedCatalog} ttl:${cacheTTL}s catalogConfig:${catalogConfigString} catalogKey:${catalogKey}`);
 
   if (isMDBListCatalog) {
@@ -1476,6 +1481,9 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
     ...options,
     refreshAhead: !isAiringTodayCatalog,
     onHit: (hit: any) => {
+      if (cacheTTL > 0 && typeof redis?.expire === 'function' && hit?.versionedKey) {
+        void Promise.resolve(redis.expire(hit.versionedKey, cacheTTL)).catch(() => {});
+      }
       if (typeof existingOnHit === 'function') {
         existingOnHit(hit);
       }
