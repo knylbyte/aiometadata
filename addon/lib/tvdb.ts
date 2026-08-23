@@ -505,7 +505,7 @@ async function getAuthToken(apiKey: string | undefined, userUUID: string | null 
     } catch (error) {
       const userSuffix = userUUID ? ` (user ${userUUID})` : '';
       logger.error(`Failed to get TVDB auth token for key ...${key.slice(-4)}${userSuffix}:`, (error as Error).message);
-      return null;
+      throw error;
     } finally {
       tokenInflight.delete(key);
     }
@@ -1053,9 +1053,9 @@ async function getStatuses(type: 'movies' | 'series', config: UserConfig): Promi
 }
 
 async function filter(type: 'movies' | 'series', params: any, config: UserConfig): Promise<TvdbFilterResult[]> {
-  return cacheWrapTvdbApi(`tvdb-filter:${type}:${stableStringify(params)}`, async () => {
+  return cacheWrapTvdbApi(`tvdb-filter:v2:${type}:${stableStringify(params)}`, async () => {
     const token = await getAuthToken(config.apiKeys?.tvdb, config.userUUID);
-    if (!token) return [];
+    if (!token) throw Object.assign(new Error('TVDB authentication required'), { status: 401 });
     
     const startTime = Date.now();
     try {
@@ -1086,7 +1086,7 @@ async function filter(type: 'movies' | 'series', params: any, config: UserConfig
       requestTracker.trackProviderCall('tvdb', responseTime, false);
       
       logger.error(`[filter] Error filtering TVDB ${type}:`, (error as Error).message);
-      return [];
+      throw error;
     }
   });
 }
@@ -1277,7 +1277,7 @@ async function getMovieLogo(movieId: string, config: UserConfig): Promise<string
 
 async function getCollectionsList(config: UserConfig, page: number = 0): Promise<TvdbCollection[]> {
   const token = await getAuthToken(config.apiKeys?.tvdb, config.userUUID);
-  if (!token) return [];
+  if (!token) throw Object.assign(new Error('TVDB authentication required'), { status: 401 });
   logger.debug(`Getting collections list for page ${page}`);
   const startTime = Date.now();
   try {
@@ -1301,44 +1301,44 @@ async function getCollectionsList(config: UserConfig, page: number = 0): Promise
     requestTracker.trackProviderCall('tvdb', responseTime, false);
     
     logger.error(`[getCollections] Error getting TVDB collections list:`, (error as Error).message);
-    return [];
+    throw error;
   }
 }
 
 async function getCollectionDetails(collectionId: string, config: UserConfig): Promise<TvdbCollection | null> {
-  return cacheWrapTvdbApi(`collection-details:${collectionId}`, async () => {
+  return cacheWrapTvdbApi(`collection-details:v2:${collectionId}`, async () => {
     const token = await getAuthToken(config.apiKeys?.tvdb, config.userUUID);
-    if (!token) return null;
+    if (!token) throw Object.assign(new Error('TVDB authentication required'), { status: 401 });
     try {
       const url = `${TVDB_API_URL}/lists/${collectionId}/extended`;
       const response = await tvdbHttpRequest(url, { headers: { 'Authorization': `Bearer ${token}` } });
       return (response.data as any)?.data;
     } catch (error) {
       logger.error(`Error fetching collection details for ID ${collectionId}:`, (error as Error).message);
-      return null;
+      throw error;
     }
   });
 }
 
 async function getCollectionBySlug(slug: string, config: UserConfig): Promise<TvdbCollection | null> {
-  return cacheWrapTvdbApi(`collection-slug:${slug}`, async () => {
+  return cacheWrapTvdbApi(`collection-slug:v2:${slug}`, async () => {
     const token = await getAuthToken(config.apiKeys?.tvdb, config.userUUID);
-    if (!token) return null;
+    if (!token) throw Object.assign(new Error('TVDB authentication required'), { status: 401 });
     try {
       const url = `${TVDB_API_URL}/lists/slug/${encodeURIComponent(slug)}`;
       const response = await tvdbHttpRequest(url, { headers: { 'Authorization': `Bearer ${token}` } });
       return (response.data as any)?.data || null;
     } catch (error) {
       logger.error(`Error fetching TVDB list for slug ${slug}:`, (error as Error).message);
-      return null;
+      throw error;
     }
   });
 }
 
 async function getCollectionTranslations(collectionId: string, language: string, config: UserConfig): Promise<TvdbCollectionTranslation | null> {
-  return cacheWrapTvdbApi(`collection-translations:${collectionId}:${language}`, async () => {
+  return cacheWrapTvdbApi(`collection-translations:v2:${collectionId}:${language}`, async () => {
     const token = await getAuthToken(config.apiKeys?.tvdb, config.userUUID);
-    if (!token) return null;
+    if (!token) throw Object.assign(new Error('TVDB authentication required'), { status: 401 });
     try {
       const url = `${TVDB_API_URL}/lists/${collectionId}/translations/${language}`;
       const response = await tvdbHttpRequest(url, { headers: { 'Authorization': `Bearer ${token}` } });
@@ -1355,7 +1355,7 @@ async function getCollectionTranslations(collectionId: string, language: string,
       return data;
     } catch (error) {
       logger.error(`Error fetching collection translations for ID ${collectionId}:`, (error as Error).message);
-      return null;
+      throw error;
     }
   });
 }

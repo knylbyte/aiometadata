@@ -13,8 +13,8 @@ const { getCatalog, fetchCatalogBatch } = require("./lib/getCatalog");
 const { applyCatalogFilters, catalogFiltersActive } = require("./utils/catalogFilters");
 const { cursorKey, readCursor, readCatalogTerminal, resolveStartPage, terminalKey, writeCatalogTerminal, writeCursor, fillFilteredPage, fillMaxPages } = require("./lib/catalogPagination");
 const { catalogPageSizeMode, fixedCatalogPageSize, resolveCatalogResponseLimit } = require("./lib/catalogPageSize");
-const { buildCanonicalCatalogCacheArgs, buildCatalogQuerySignature, hydrateCanonicalPageWindow, resolveCanonicalPageWindow, resumeStateForCanonicalPosition, writeCanonicalPages } = require("./lib/catalogFetchPlanner");
-const { createCatalogSourceAdapter } = require("./lib/catalogSourceAdapter");
+const { buildCanonicalCatalogCacheArgs, buildCatalogSourceQuerySignature, buildDeliveryCursorSignature, hydrateCanonicalPageWindow, resolveCanonicalPageWindow, writeCanonicalPages } = require("./lib/catalogFetchPlanner");
+const { attachProviderPageMetadata, createCatalogSourceAdapter, providerPageResultFromHandler } = require("./lib/catalogSourceAdapter");
 const { resolveEffectiveCatalogTtl } = require("./lib/catalogTtl");
 const anilist = require("./lib/anilist");
 const { getSearch } = require("./lib/getSearch");
@@ -4380,9 +4380,10 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     cleanId.startsWith('mdblist.') &&
     usesMdblistExternalItemsEndpoint(catalogConfig);
   if (isCursorSensitiveMdblistCatalog) {
-    cacheExtraArgs._mdblistPaging = 'typed-canonical-v5';
+    cacheExtraArgs._mdblistPaging = 'typed-canonical-v6';
   }
 
+  const deliveryActivityFingerprints = {};
   if (cleanId.startsWith('simkl.watchlist.') || cleanId.startsWith('simkl.upnext')) {
     try {
       const { getSimklToken, getSimklActivityFingerprint } = require('./utils/simklUtils');
@@ -4407,7 +4408,10 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
             pairs.map(([t, s]) => getSimklActivityFingerprint(token.access_token, t, s))
           );
           const fp = fps.filter(Boolean).join('+');
-          if (fp) cacheExtraArgs._simklAct = fp;
+          if (fp) {
+            cacheExtraArgs._simklAct = fp;
+            deliveryActivityFingerprints.simkl = fp;
+          }
         }
       }
     } catch (e) {
@@ -4435,7 +4439,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     }
   }
 
-  const querySignature = buildCatalogQuerySignature({
+  const sourceQuerySignature = buildCatalogSourceQuerySignature({
     catalogId: cleanId,
     type: actualType,
     language,
@@ -4444,12 +4448,22 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     catalogConfig,
     configFingerprint: {
       sfw: config.sfw,
-      hideWatched: config.hideWatched,
-      filters: config.filters || null,
+      includeAdult: config.includeAdult,
+      timezone: config.timezone,
+      providers: config.providers || null,
+      accountScope: /^(trakt|anilist|simkl|movielens|publicmetadb|tmdb\.(watchlist|favorites))\./.test(cleanId)
+        ? userUUID
+        : null,
     },
   });
+  const deliveryCursorSignature = buildDeliveryCursorSignature({
+    sourceQuerySignature,
+    config,
+    catalogConfig,
+    activityFingerprints: deliveryActivityFingerprints,
+  });
   const pageSizeMode = catalogPageSizeMode();
-  const pageSizeCursorKey = cursorKey(userUUID, cleanId, actualType, querySignature, skipValue);
+  const pageSizeCursorKey = cursorKey(userUUID, cleanId, actualType, deliveryCursorSignature, skipValue);
   const storedCursor = skipValue > 0 ? await readCursor(pageSizeCursorKey) : null;
   const isSearchCatalog = cleanId === 'search' || cleanId === 'gemini.search' || cleanId === 'people_search';
   const responseLimit = isSearchCatalog
@@ -4459,7 +4473,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     || responseLimit !== canonicalPageSize
     || (skipValue % canonicalPageSize) !== 0;
   const useCursorPagination = filtersActive || isCursorSensitiveMdblistCatalog || useOuterPageSizeCursor;
-  const catalogTerminalKey = terminalKey(userUUID, querySignature);
+  const catalogTerminalKey = terminalKey(userUUID, sourceQuerySignature);
   const catalogTtlPolicy = resolveEffectiveCatalogTtl({ catalogConfig });
 
   const cacheOptions = {
@@ -4467,6 +4481,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     maxRetries: 2,
     config,
     effectiveCatalogTtl: catalogTtlPolicy.canonicalPageTtl,
+    canonicalSourceSignature: sourceQuerySignature,
   };
   
   try {
@@ -4607,6 +4622,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
           }
           case 'mal.genres': {
             const mediaType = type_filter || null;
+            let rawCount = 0;
             const allAnimeGenres = await cacheWrapJikanApi('anime-genres', async () => {
               return await jikan.getAnimeGenres();
             }, null);
@@ -4618,21 +4634,32 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
                 const animeResults = await cacheWrapJikanApi(`mal-genre-${genreId}-${mediaType || 'all'}-${page}-${config.sfw}`, async () => {
                   return await jikan.getAnimeByGenre(genreId, mediaType, page, config);
                 }, null);
+                rawCount = animeResults.length;
                 metas = await parseAnimeCatalogMetaBatch(animeResults, config, language);
               }
             }
+            metas = attachProviderPageMetadata(metas, {
+              rawCount,
+              hasMore: rawCount >= parseInt(process.env.MAL_PAGE_SIZE || '25', 10),
+            });
             break;
           }
           case 'mal.genre_search': {
             const { getSearch } = require('./lib/getSearch');
             const searchResult = await getSearch(cleanId, actualType, language, extraArgs, config);
-            metas = searchResult.metas || [];
+            metas = attachProviderPageMetadata(searchResult.metas || [], {
+              rawCount: (searchResult.metas || []).length,
+              exhaustion: 'unknown',
+            });
             break;
           }
           case 'mal.va_search': {
             const { getSearch } = require('./lib/getSearch');
             const searchResult = await getSearch(cleanId, actualType, language, extraArgs, config);
-            metas = searchResult.metas || [];
+            metas = attachProviderPageMetadata(searchResult.metas || [], {
+              rawCount: (searchResult.metas || []).length,
+              exhaustion: 'unknown',
+            });
             break;
           }
           default: {
@@ -4644,7 +4671,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     };
 
     const keyForPage = (page) => {
-      const pageArgs = buildCanonicalCatalogCacheArgs(cacheExtraArgs, page, canonicalPageSize, querySignature);
+      const pageArgs = buildCanonicalCatalogCacheArgs(cacheExtraArgs, page, canonicalPageSize, sourceQuerySignature);
       return `${cleanId}:${actualType}:${stableStringify(pageArgs)}`;
     };
 
@@ -4652,7 +4679,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
       catalogId: cleanId,
       catalogConfig,
       canonicalPageSize,
-      querySignature,
+      querySignature: sourceQuerySignature,
       type: actualType,
       language,
       genre: genreName || null,
@@ -4679,26 +4706,24 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
         const pageSkip = isOffsetBased ? (page - 1) * nativePageSize : undefined;
         const result = await runCatalogPage(page, pageSkip);
         const metas = result?.metas || [];
-        const info = metas?._providerPageInfo || result?._providerPageInfo || {};
-        return {
+        return providerPageResultFromHandler({
+          catalogId: cleanId,
+          canonicalPageSize,
+          page,
+          nativePageSize,
           metas,
-          rawCount: Number.isInteger(info.rawCount) ? info.rawCount : metas.length,
-          entries: info.entries,
-          resumeAfterBatch: info.resumeAfterBatch,
-          exhaustion: info.exhaustion,
-          hasMore: info.hasMore,
-          total: info.total,
-        };
+        });
       },
     });
     const readCachedPage = (page) => readCatalogCache(userUUID, keyForPage(page), {
       config,
       effectiveCatalogTtl: catalogTtlPolicy.canonicalPageTtl,
+      canonicalSourceSignature: sourceQuerySignature,
     });
     const writeCachedPage = (page, value) =>
       cacheWrapper(userUUID, keyForPage(page), async () => value, cacheOptions);
     const hydratedPages = new Map();
-    const hydrateWindow = async (absoluteSkip, limit, sourceAnchor) => {
+    const hydrateWindow = async (absoluteSkip, limit) => {
       const result = await hydrateCanonicalPageWindow({
         window: resolveCanonicalPageWindow(absoluteSkip, limit, canonicalPageSize),
         adapter: sourceAdapter,
@@ -4707,7 +4732,6 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
         writePages: pages => writeCanonicalPages(pages, writeCachedPage),
         readTerminal: () => readCatalogTerminal(catalogTerminalKey, catalogTtlPolicy.terminalTtl),
         writeTerminal: state => writeCatalogTerminal(catalogTerminalKey, state, catalogTtlPolicy.terminalTtl),
-        sourceAnchor,
         maxBatches: Math.max(20, fillMaxPages() * 4),
       });
       for (const [page, value] of result.pages) hydratedPages.set(page, value);
@@ -4723,11 +4747,9 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
 
       if (useCursorPagination) {
       const { startPage, startOffset, matched } = await resolveStartPage(pageSizeCursorKey, skipValue, catalogPage, catalogPageOffset);
-      const cursorSourceResume = matched ? storedCursor?.sourceResume : undefined;
       await hydrateWindow(
         (startPage - 1) * canonicalPageSize + startOffset,
-        responseLimit,
-        cursorSourceResume ? { canonicalPage: startPage - 1, resumeState: cursorSourceResume } : undefined
+        responseLimit
       );
       const seenFilteredIds = new Set();
 
@@ -4738,11 +4760,16 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
         sourcePageSize: canonicalPageSize,
         maxPages: Math.max(fillMaxPages(), Math.ceil((responseLimit + startOffset) / canonicalPageSize) + fillMaxPages()),
         fetchPage: async (page) => {
-          return (await getCanonicalPage(page))?.metas || [];
+          return await getCanonicalPage(page);
         },
-        filter: async (metas) => {
-          const filtered = await applyCatalogFilters(metas, { type: actualType, config, catalogConfig, cleanId });
-          return filtered.filter((meta) => {
+        filterEntries: async (entries) => {
+          const filtered = await applyCatalogFilters(entries.map(entry => entry.meta), {
+            type: actualType, config, catalogConfig, cleanId
+          });
+          const accepted = new Set(filtered);
+          return entries.filter((entry) => {
+            const meta = entry.meta;
+            if (!accepted.has(meta)) return false;
             if (!meta?.id) return true;
             if (seenFilteredIds.has(meta.id)) return false;
             seenFilteredIds.add(meta.id);
@@ -4758,11 +4785,8 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
         page: filled.nextPage,
         offset: filled.nextOffset,
         responseLimit,
-        sourceResume: await resumeStateForCanonicalPosition(
-          filled.nextPage,
-          filled.nextOffset,
-          async page => hydratedPages.get(page) || await readCachedPage(page)
-        ),
+        canonicalSourceStart: filled.canonicalPageSourceStart,
+        itemResumeAfterServed: filled.sourceResumeAfterLastServed,
       };
 
       consola.debug(
@@ -4775,10 +4799,11 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
       if (responseData?._canonical?.transient) {
         pendingCursor = {
           skip: skipValue,
-          page: catalogPage + 1,
-          offset: 0,
+          page: catalogPage,
+          offset: responseData.metas.length,
           responseLimit,
-          sourceResume: responseData._canonical.sourceNext,
+          canonicalSourceStart: responseData._canonical.sourceStart,
+          itemResumeAfterServed: responseData._canonical.entryResumes[responseData.metas.length - 1],
         };
       }
     }
@@ -4814,13 +4839,16 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
 
     if (pendingCursor) {
       const served = pendingCursor.skip + (responseData?.metas?.length || 0);
-      await writeCursor(cursorKey(userUUID, cleanId, actualType, querySignature, served), {
+      await writeCursor(cursorKey(userUUID, cleanId, actualType, deliveryCursorSignature, served), {
         served,
         upstreamPage: pendingCursor.page,
         pageOffset: pendingCursor.offset,
         canonicalPage: pendingCursor.page,
         canonicalOffset: pendingCursor.offset,
-        sourceResume: pendingCursor.sourceResume,
+        filteredOffset: pendingCursor.offset,
+        canonicalSourceStart: pendingCursor.canonicalSourceStart,
+        itemResumeAfterServed: pendingCursor.itemResumeAfterServed,
+        deliverySignature: deliveryCursorSignature,
         responseLimit: pendingCursor.responseLimit,
       });
     }

@@ -3,6 +3,7 @@ const moviedb: any = require("./getTmdb");
 const translations: any = require("../static/translations.json");
 const { getMeta }: any = require("./getMeta");
 const { cacheWrapMetaSmart }: any = require("./getCache");
+const { attachProviderPageMetadata }: any = require("./catalogSourceAdapter");
 
 
 function getAllTranslations(key: string): string[] {
@@ -124,7 +125,7 @@ async function getPersonalList(
 ): Promise<{ metas: any[] }> {
   if (!sessionId) {
     console.warn(`[TMDB Personal List] Attempted to fetch personal ${listType} without a session ID. User needs to authenticate with TMDB.`);
-    return { metas: [] };
+    throw Object.assign(new Error('TMDB session authentication required'), { status: 401 });
   }
 
   try {
@@ -161,7 +162,13 @@ async function getPersonalList(
 
     const validMetas = metas.filter((meta: any) => meta !== null);
 
-    return { metas: validMetas };
+    return {
+      metas: attachProviderPageMetadata(validMetas, {
+        rawCount: sortedResults.length,
+        hasMore: Number(res?.page || page) < Number(res?.total_pages || 1),
+        total: res?.total_results,
+      }),
+    };
 
   } catch (error: any) {
     console.error(`[TMDB Personal List] Error fetching personal ${listType} for ${type}:`, error.message);
@@ -169,7 +176,7 @@ async function getPersonalList(
       console.error(`[TMDB Personal List] Error response:`, error.response.data);
       console.error(`[TMDB Personal List] Error status:`, error.response.status);
     }
-    return { metas: [] };
+    throw error;
   }
 }
 

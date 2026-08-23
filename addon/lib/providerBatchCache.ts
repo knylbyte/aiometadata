@@ -2,8 +2,10 @@ import { createHash } from 'node:crypto';
 import { cacheWrapGlobal } from './getCache';
 import type { ProviderBatchResult, ProviderResumeState } from './catalogFetchPlanner';
 import { isProviderResumeState, stableCatalogStringify } from './catalogFetchPlanner';
+import redis from './redisClient';
+import { capRedisTtl } from './catalogTtl';
 
-export const PROVIDER_BATCH_CACHE_VERSION = 'provider-batch:v2';
+export const PROVIDER_BATCH_CACHE_VERSION = 'provider-batch:v3';
 
 interface MemoryEntry {
   expiresAt: number;
@@ -60,7 +62,10 @@ export async function fetchProviderBatchCached(input: {
   const persistent = ttl > 0;
   if (!input.bypass && persistent) {
     const local = memory.get(key);
-    if (local && local.expiresAt > Date.now()) return local.value;
+    if (local && local.expiresAt > Date.now()) {
+      local.expiresAt = Math.min(local.expiresAt, Date.now() + ttl * 1000);
+      return local.value;
+    }
     if (local) memory.delete(key);
   }
   if (!input.bypass) {
@@ -71,10 +76,13 @@ export async function fetchProviderBatchCached(input: {
   const load = async () => {
     const result = input.useRedis === false || !persistent
       ? await input.loader()
-      : await cacheWrapGlobal(key, input.loader, ttl, {
+        : await cacheWrapGlobal(key, input.loader, ttl, {
           upstream: true,
           enableErrorCaching: false,
           maxRetries: 0,
+          onHit: (hit: any) => {
+            if (hit?.versionedKey) void capRedisTtl(redis as any, hit.versionedKey, ttl);
+          },
         });
     if (!result || !Array.isArray(result.entries)
       || !Number.isInteger(result.rawCount) || result.rawCount < 0
@@ -94,4 +102,8 @@ export async function fetchProviderBatchCached(input: {
 export function clearProviderBatchCacheForTests(): void {
   memory.clear();
   inFlight.clear();
+}
+
+export function providerBatchMemoryExpiryForTests(key: string): number | undefined {
+  return memory.get(key)?.expiresAt;
 }

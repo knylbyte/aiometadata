@@ -545,17 +545,17 @@ These caps bound the per-process heap used by module-level caches. The defaults 
 - **Description**: Canonical internal catalog cache-page size. All clients share these pages regardless of requested response limit. In `fixed` mode this is also the client response limit.
 - **Example**: `CATALOG_LIST_ITEMS_SIZE=20`
 
-Canonical pages use the `canonical-v5` namespace and store exact provider resume boundaries. Runtime requests and cache warmup therefore read and write the same pages even when client response limits differ. Catalog `cacheTTL` is expiration policy only and is not part of the content key.
+Canonical pages use the `canonical-v6` namespace and store only trusted provider resumes at canonical page boundaries. Runtime requests and cache warmup therefore read and write the same pages even when client response limits or local delivery filters differ. Catalog `cacheTTL` is expiration policy only and is not part of the content key.
 
-`canonical-v5`, `catalog-cursor:v5`, `canonical-terminal:v5`, and `provider-batch:v2` intentionally ignore older v4/v1 paging data. The migration prevents pages produced with incorrect provider geometry or raw offsets from being reused; old keys expire naturally, while meta, mapping, genre, poster, TMDB, and TVDB caches remain untouched.
+`canonical-v6`, `catalog-cursor:v6`, `canonical-terminal:v6`, and `provider-batch:v3` intentionally ignore older v5/v2 paging data. The migration prevents shifted pages, intra-page boundary resumes, cached provider failures, and old TTL semantics from being reused; old keys expire naturally, while meta, mapping, genre, poster, TMDB, and TVDB caches remain untouched.
 
 ### `CATALOG_PROVIDER_BATCH_TTL`
 - **Default**: `300`
-- **Description**: Maximum lifetime for reconstructed provider batches shared by runtime and warmup. The effective batch TTL is `min(CATALOG_PROVIDER_BATCH_TTL, catalogConfig.cacheTTL || CATALOG_TTL)`. A catalog TTL of `0` disables persistent batch caching but retains in-process single-flight.
+- **Description**: Maximum lifetime for reconstructed provider batches shared by runtime and warmup. The effective batch TTL is `min(CATALOG_PROVIDER_BATCH_TTL, catalogConfig.cacheTTL || CATALOG_TTL)`. Reads never extend the remaining TTL; a shorter effective TTL only caps it downward. A catalog TTL of `0` disables persistent batch caching but retains in-process single-flight.
 
 ### `CATALOG_TERMINAL_TTL`
 - **Default**: `CATALOG_TTL`
-- **Description**: Maximum lifetime for confirmed end-of-catalog markers. It is always capped by the effective catalog TTL and is disabled when that TTL is `0`.
+- **Description**: Maximum lifetime for confirmed end-of-catalog markers. It is always capped by the effective catalog TTL, is never renewed by reads, and is disabled when that TTL is `0`.
 
 ### `CATALOG_REQUEST_LIMIT_FALLBACK`
 - **Default**: `20`

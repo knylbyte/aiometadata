@@ -4,7 +4,7 @@ import * as Utils from '../utils/parseProps.js';
 import { getMeta } from './getMeta.js';
 import { cacheWrapMetaSmart } from './getCache.js';
 import { UserConfig } from '../types/index.js';
-import { allowsUnrated, hasAgeRatingCap, passesAgeRating } from '../utils/ageRating.js';
+import { attachProviderPageMetadata } from './catalogSourceAdapter.js';
 const consola = require('consola');
 
 const logger = consola.withTag('GetTrending'); 
@@ -60,35 +60,20 @@ async function getTrending(type: string, language: string, page: number, genre: 
     const validMetas = metas.filter(meta => meta !== null);
     logger.debug(`[getTrending] ${validMetas.length} Metas processing took ${metasTime.toFixed(2)}ms`);
 
-    const userRating = config.ageRating;
-    let filteredMetas = validMetas;
-
-    if (hasAgeRatingCap(config)) {
-      const allowUnrated = allowsUnrated(config);
-      const beforeCount = filteredMetas.length;
-      const filterStartTime = performance.now();
-
-      filteredMetas = validMetas.filter(meta =>
-        passesAgeRating(meta.app_extras?.certification, type, userRating, allowUnrated)
-      );
-
-      const afterCount = filteredMetas.length;
-      const filterTime = performance.now() - filterStartTime;
-      if (beforeCount !== afterCount) {
-        logger.debug(`[getTrending] Age rating filter removed ${beforeCount - afterCount} items in ${filterTime.toFixed(2)}ms`);
-      }
-    } else {
-      logger.debug(`[getTrending] No age rating filtering applied (ageRating: ${userRating})`);
-    }
-    
     const totalTime = performance.now() - startTime;
     logger.debug(`[getTrending] Total function execution took ${totalTime.toFixed(2)}ms`);
     
-    return { metas: filteredMetas };
+    return {
+      metas: attachProviderPageMetadata(validMetas, {
+        rawCount: (res?.results || []).length,
+        hasMore: Number(res?.page || page) < Number(res?.total_pages || 1),
+        total: res?.total_results,
+      }),
+    };
 
   } catch (error: any) {
     console.error(`Error fetching trending for type=${type}:`, error.message);
-    return { metas: [] };
+    throw error;
   }
 }
 

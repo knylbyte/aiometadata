@@ -35,6 +35,7 @@ const logger = consola.withTag('Catalog');
 import { cacheWrapMetaSmart } from './getCache.js';
 import { UserConfig } from '../types/index.js';
 import { catalogRequestPageSize } from './catalogPageSize.js';
+import { getCatalogProviderDefinition } from './catalogSourceAdapter.js';
 
 const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p/w500';
 const TVDB_IMAGE_BASE = 'https://artworks.thetvdb.com';
@@ -51,6 +52,12 @@ function attachProviderPageInfo(metas: any[], info: Record<string, any>): any[] 
     configurable: true,
   });
   return metas;
+}
+
+function providerRequestPageSize(catalogId: string): number {
+  const canonicalPageSize = catalogRequestPageSize();
+  const definition = getCatalogProviderDefinition({ catalogId, canonicalPageSize });
+  return definition.capabilities.nativePageSize || definition.capabilities.maxLimit;
 }
 
 async function getCatalog(type: string, language: string, page: number, id: string, genre: string, config: UserConfig, userUUID: string, includeVideos: boolean = false, skip?: number): Promise<{ metas: any[] }> {
@@ -159,8 +166,7 @@ async function getCatalog(type: string, language: string, page: number, id: stri
     }
 
     else {
-      logger.warn(`Received request for unknown catalog prefix: ${id}`);
-      return { metas: [] };
+      throw Object.assign(new Error(`Unknown catalog prefix: ${id}`), { status: 400 });
     }
   } catch (error: any) {
     const errorLine = error.stack?.split('\n')[1]?.trim() || 'unknown';
@@ -374,7 +380,11 @@ async function getMalDiscoverCatalog(
 
     if (!response?.items || response.items.length === 0) {
       logger.info(`[MAL Discover] No results for ${catalogId} at page ${page}`);
-      return [];
+      return attachProviderPageInfo([], {
+        rawCount: 0,
+        hasMore: response?.hasMore ?? false,
+        total: response?.total,
+      });
     }
 
     // Convert Jikan anime objects to the format expected by resolveMALItemsToMetas
@@ -519,8 +529,7 @@ async function getMalCatalog(
       return await jikan.getAnimeBySeason(year, season, page, config);
     }, null);
   } else {
-    logger.warn(`[MAL] Unknown catalog id: ${catalogId}`);
-    return [];
+    throw Object.assign(new Error(`[MAL] Unknown catalog id: ${catalogId}`), { status: 400 });
   }
 
   const metas = await Utils.parseAnimeCatalogMetaBatch(animeResults, config, language);
@@ -538,7 +547,7 @@ async function getTvmazeScheduleHandler(
   const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
   const date = formatter.format(new Date());
   const country = genre && genre !== 'None' ? genre.toUpperCase() : '';
-  const pageSize = catalogRequestPageSize();
+  const pageSize = providerRequestPageSize('tvmaze.schedule');
 
   const result = await getTvmazeScheduleCatalog({
     date,
@@ -553,8 +562,9 @@ async function getTvmazeScheduleHandler(
     maxRetries: 2,
   });
   return attachProviderPageInfo(result.metas, {
-    rawCount: result.metas.length,
-    hasMore: result.metas.length >= pageSize ? undefined : false,
+    rawCount: result.rawCount,
+    hasMore: result.hasMore,
+    total: result.total,
   });
 }
 
@@ -649,7 +659,7 @@ async function getTvdbCatalog(type: string, catalogId: string, genreName: string
   logger.debug(`Fetching TVDB catalog: ${catalogId}, Genre: ${genreName}, Page: ${page}`);
   
   // Cache the raw TVDB API response using a cache key that doesn't include page
-  const cacheKey = `tvdb-filter:${type}:${genreName}:${language}:${isTrending}`;
+  const cacheKey = `tvdb-filter:v2:${type}:${genreName}:${language}:${isTrending}`;
   
   const allTvdbGenres = await getGenreList('tvdb', language, type as "movie" | "series", config);
   logger.debug(`TVDB genres fetched: ${allTvdbGenres.length} genres available`);
@@ -723,7 +733,7 @@ async function getTvdbCatalog(type: string, catalogId: string, genreName: string
   
   if (!results || results.length === 0) {
     logger.warn(`No results from TVDB filter, returning empty array`);
-    return [];
+    return attachProviderPageInfo([], { rawCount: 0, hasMore: false });
   }
 
   let filteredResults = results;
@@ -747,7 +757,7 @@ async function getTvdbCatalog(type: string, catalogId: string, genreName: string
   const sortedResults = filteredResults.sort((a: any, b: any) => b.score - a.score);
   
   // Apply client-side pagination
-  const pageSize = catalogRequestPageSize();
+  const pageSize = providerRequestPageSize(catalogId);
   const startIndex = (page - 1) * pageSize;
   const endIndex = startIndex + pageSize;
   const paginatedResults = sortedResults.slice(startIndex, endIndex);
@@ -773,21 +783,25 @@ async function getTvdbCatalog(type: string, catalogId: string, genreName: string
   let validMetas = metas.filter(meta => meta !== null);
   validMetas.sort((a, b) => new Date(b.released).getTime() - new Date(a.released).getTime());
   
-  return validMetas;
+  return attachProviderPageInfo(validMetas, {
+    rawCount: paginatedResults.length,
+    hasMore: endIndex < sortedResults.length,
+    total: sortedResults.length,
+  });
 }
 
 async function getTvdbCollectionsCatalog(type: string, id: string, page: number, language: string, config: UserConfig): Promise<any[]> {
   const langCode = language.split('-')[0];
   if (id === 'tvdb.collections') {
     // Cache the collections list for this specific page
-    const collections = await cacheWrapTvdbApi(`collections-list:${page}`, () => tvdb.getCollectionsList(config, page));
-    if (!collections || !collections.length) return [];
+    const collections = await cacheWrapTvdbApi(`collections-list:v2:${page}`, () => tvdb.getCollectionsList(config, page));
+    if (!collections || !collections.length) return attachProviderPageInfo([], { rawCount: 0, hasMore: false });
     
     logger.info(`Page ${page}: fetched ${collections.length} collections from TVDB API`);
     
     // Fetch extended details and translations for each collection in parallel
     const metas = await Promise.all(collections.map(async (col: any) => {
-      const extended = await cacheWrapTvdbApi(`collection-extended:${col.id}`, () => tvdb.getCollectionDetails(col.id, config));
+      const extended = await cacheWrapTvdbApi(`collection-extended:v2:${col.id}`, () => tvdb.getCollectionDetails(col.id, config));
       if (!extended || !Array.isArray(extended.entities)) return null;
       
       // Only include collections that have at least one movie
@@ -810,16 +824,15 @@ async function getTvdbCollectionsCatalog(type: string, id: string, page: number,
         year: extended.year || null
       };
     }));
-    return metas.filter(Boolean);
+    return attachProviderPageInfo(metas.filter(Boolean), { rawCount: collections.length });
   }
-  return [];
+  throw Object.assign(new Error(`Unsupported TVDB collections catalog: ${id}`), { status: 400 });
 }
 
 async function getTvdbListCatalog(type: string, id: string, page: number, language: string, config: UserConfig, userUUID: string, includeVideos: boolean = false): Promise<any[]> {
   const match = id.match(/^tvdb\.list\.(\d+)(?:\.(movies|series))?$/);
   if (!match) {
-    logger.warn(`[TVDB List] Unrecognized catalog id ${id}`);
-    return [];
+    throw Object.assign(new Error(`[TVDB List] Unrecognized catalog id ${id}`), { status: 400 });
   }
   const listId = match[1];
   const suffix = match[2];
@@ -834,7 +847,7 @@ async function getTvdbListCatalog(type: string, id: string, page: number, langua
   const entities = Array.isArray(details?.entities) ? [...details.entities] : [];
   if (!entities.length) {
     logger.info(`[TVDB List] List ${listId} has no entries`);
-    return [];
+    return attachProviderPageInfo([], { rawCount: 0, hasMore: false, total: 0 });
   }
   entities.sort((a: any, b: any) => (a.order || 0) - (b.order || 0));
 
@@ -842,11 +855,11 @@ async function getTvdbListCatalog(type: string, id: string, page: number, langua
   const wantsSeries = configuredType === 'series' || configuredType === 'all';
   const selected = entities.filter((e: any) => (e.movieId && wantsMovies) || (e.seriesId && wantsSeries));
 
-  const pageSize = catalogRequestPageSize();
+  const pageSize = providerRequestPageSize(id);
   const listPage = typeof page === 'number' ? page : parseInt(String(page), 10) || 1;
   const startIndex = Math.max(0, (listPage - 1) * pageSize);
   const pageEntities = selected.slice(startIndex, startIndex + pageSize);
-  if (!pageEntities.length) return [];
+  if (!pageEntities.length) return attachProviderPageInfo([], { rawCount: 0, hasMore: false, total: selected.length });
 
   const metas = await Promise.all(pageEntities.map(async (entity: any) => {
     const entityType = entity.movieId ? 'movie' : 'series';
@@ -864,7 +877,11 @@ async function getTvdbListCatalog(type: string, id: string, page: number, langua
 
   const validMetas = metas.filter(meta => meta !== null);
   logger.success(`[TVDB List] Processed ${validMetas.length} items for ${id} (page ${listPage})`);
-  return validMetas;
+  return attachProviderPageInfo(validMetas, {
+    rawCount: pageEntities.length,
+    hasMore: startIndex + pageEntities.length < selected.length,
+    total: selected.length,
+  });
 }
 
 async function getTvdbDiscoverCatalog(
@@ -883,16 +900,14 @@ async function getTvdbDiscoverCatalog(
     || config.catalogs?.find(c => c.id === id);
 
   if (!catalogConfig) {
-    logger.warn(`[TVDB Discover] Catalog configuration not found for ${id}`);
-    return [];
+    throw Object.assign(new Error(`[TVDB Discover] Catalog configuration not found for ${id}`), { status: 400 });
   }
 
   const isMovieCatalog = type === 'movie';
   const isSeriesCatalog = type === 'series';
 
   if (!isMovieCatalog && !isSeriesCatalog) {
-    logger.warn(`[TVDB Discover] Unsupported type for discover catalog: ${type}`);
-    return [];
+    throw Object.assign(new Error(`[TVDB Discover] Unsupported type for discover catalog: ${type}`), { status: 400 });
   }
 
   const discoverMetadata = catalogConfig?.metadata?.discover || {};
@@ -917,13 +932,13 @@ async function getTvdbDiscoverCatalog(
 
   const tvdbType = isMovieCatalog ? 'movies' : 'series';
   const discoverPage = typeof page === 'number' ? page : parseInt(String(page), 10) || 1;
-  const pageSize = catalogRequestPageSize();
+  const pageSize = providerRequestPageSize(id);
 
   try {
     const response = await tvdb.filter(tvdbType, parameters, config);
     if (!Array.isArray(response) || response.length === 0) {
       logger.info(`[TVDB Discover] No results for ${id} at page ${discoverPage}`);
-      return [];
+      return attachProviderPageInfo([], { rawCount: 0, hasMore: false, total: 0 });
     }
 
     const startIndex = Math.max(0, (discoverPage - 1) * pageSize);
@@ -954,10 +969,14 @@ async function getTvdbDiscoverCatalog(
 
     const validMetas = metas.filter(meta => meta !== null);
     logger.success(`[TVDB Discover] Processed ${validMetas.length} items for ${id}`);
-    return validMetas;
+    return attachProviderPageInfo(validMetas, {
+      rawCount: paginatedResults.length,
+      hasMore: endIndex < response.length,
+      total: response.length,
+    });
   } catch (error: any) {
     logger.error(`[TVDB Discover] Error fetching catalog ${id}: ${error.message}`);
-    return [];
+    throw error;
   }
 }
 
@@ -999,7 +1018,10 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       }));
 
       let metas = await parseMDBListItems(normalizedItems, type, language, config, includeVideos);
-      return metas;
+      return attachProviderPageInfo(metas, {
+        rawCount: response.items.length,
+        hasMore: response.hasMore,
+      });
     }
 
     // Handle MDBList Up Next catalog
@@ -1007,7 +1029,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       // MDBList Up Next catalog - only supports series type
       if (type !== 'series') {
         logger.info(`MDBList Up Next: Type ${type} requested, returning empty (only series supported)`);
-        return [];
+        return attachProviderPageInfo([], { rawCount: 0, hasMore: false });
       }
       
       const upNextStart = Date.now();
@@ -1028,12 +1050,12 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       // Early exit for empty pages beyond list end
       if (!response.hasMore && (!response.items || response.items.length === 0)) {
         logger.info(`[MDBList Up Next] No more items at page ${pageNum}`);
-        return [];
+        return attachProviderPageInfo([], { rawCount: 0, hasMore: false });
       }
       
       if (!response.items || response.items.length === 0) {
         logger.info(`[MDBList Up Next] No items found for page ${pageNum}`);
-        return [];
+        return attachProviderPageInfo([], { rawCount: 0, hasMore: response.hasMore });
       }
       
       const totalTime = Date.now() - upNextStart;
@@ -1049,7 +1071,10 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       logger.info(`[MDBList Up Next] parseMDBListUpNextItems took ${parseTime}ms for ${response.items.length} items`);
       
       logger.success(`[MDBList Up Next] Processed ${metas.length} items`);
-      return metas;
+      return attachProviderPageInfo(metas, {
+        rawCount: response.items.length,
+        hasMore: response.hasMore,
+      });
     }
     
     if (usesMdblistExternalItemsEndpoint(catalogConfig)) {
@@ -1082,7 +1107,11 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
 
       let metas = await parseMDBListItems(response.items, type, language, config, includeVideos);
 
-      return metas;
+      return attachProviderPageInfo(metas, {
+        rawCount: response.rawCount,
+        hasMore: response.hasMore,
+        exhaustion: response.exhaustion,
+      });
     }
 
     const sort = catalogConfig?.sort === 'default' ? undefined : catalogConfig?.sort;
@@ -1109,6 +1138,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       // Non-unified watchlist (separate movies/series catalogs)
       listId = 'watchlist';
       unified = false;
+      mediaTypeFilter = id.endsWith('.movies') ? 'movie' : 'show';
     } else if (id.startsWith('mdblist.recommended.')) {
       const parts = id.split('.');
       listId = `recommended/${parts[2]}`;
@@ -1154,7 +1184,11 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       // Early exit for empty pages beyond list end
       if (!response.hasMore && response.items.length === 0) {
         logger.debug(`MDBList watchlist early exit - no more items at page ${page}`);
-        return [];
+        return attachProviderPageInfo([], {
+          rawCount: response.rawCount,
+          hasMore: false,
+          exhaustion: response.exhaustion,
+        });
       }
     } else if (response.totalItems !== undefined && response.totalPages !== undefined) {
       const pageInfo = `page ${page}/${response.totalPages}`;
@@ -1167,7 +1201,11 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       // Early exit for empty pages beyond list end
       if (!response.hasMore && response.items.length === 0) {
         logger.debug(`MDBList early exit - no more items for list ${listId} at page ${page}`);
-        return [];
+        return attachProviderPageInfo([], {
+          rawCount: response.rawCount,
+          hasMore: false,
+          exhaustion: response.exhaustion,
+        });
       }
       
       // Performance warning for large offsets
@@ -1178,7 +1216,12 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
     
     let metas = await parseMDBListItems(response.items, type, language, config, includeVideos);
 
-    return metas;
+    return attachProviderPageInfo(metas, {
+      rawCount: response.rawCount,
+      hasMore: response.hasMore,
+      total: response.totalItems,
+      exhaustion: response.exhaustion,
+    });
   }
 
   // Handle custom TMDB Discover catalogs (tmdb.discover.{customId})
@@ -1192,12 +1235,11 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
 
     if (!tmdbApiKey) {
       logger.warn('[TMDB Discover] Missing API key');
-      return [];
+      throw Object.assign(new Error('TMDB authentication required'), { status: 401 });
     }
 
     if (!isMovieCatalog && !isSeriesCatalog) {
-      logger.warn(`[TMDB Discover] Unsupported type for discover catalog: ${type}`);
-      return [];
+      throw Object.assign(new Error(`[TMDB Discover] Unsupported type for discover catalog: ${type}`), { status: 400 });
     }
 
     const mediaType = isMovieCatalog ? 'movie' : 'tv';
@@ -1253,7 +1295,11 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
 
       if (!response?.results || !Array.isArray(response.results) || response.results.length === 0) {
         logger.info(`[TMDB Discover] No results for ${id} at page ${discoverPage}`);
-        return [];
+        return attachProviderPageInfo([], {
+          rawCount: 0,
+          hasMore: false,
+          total: response?.total_results || 0,
+        });
       }
 
       let results = response.results;
@@ -1278,7 +1324,13 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
         if (results.length < response.results.length) {
           logger.info(`[TMDB Discover] Runtime filter kept ${results.length}/${response.results.length} items for ${id} at page ${discoverPage}`);
         }
-        if (results.length === 0) return [];
+        if (results.length === 0) {
+          return attachProviderPageInfo([], {
+            rawCount: response.results.length,
+            hasMore: discoverPage < (response.total_pages || 1),
+            total: response.total_results,
+          });
+        }
       }
 
       const metaType = mediaType === 'movie' ? 'movie' : 'series';
@@ -1302,10 +1354,14 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
 
       const validMetas = metas.filter(meta => meta !== null);
       logger.success(`[TMDB Discover] Processed ${validMetas.length} items for ${id}`);
-      return validMetas;
+      return attachProviderPageInfo(validMetas, {
+        rawCount: response.results.length,
+        hasMore: discoverPage < (response.total_pages || 1),
+        total: response.total_results,
+      });
     } catch (error: any) {
       logger.error(`[TMDB Discover] Error fetching catalog ${id}: ${error.message}`);
-      return [];
+      throw error;
     }
   }
 
@@ -1315,8 +1371,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
 
     const collectionId = id.split('.')[2];
     if (!collectionId) {
-      logger.error(`[TMDB Collection] Invalid collection id format: ${id}`);
-      return [];
+      throw Object.assign(new Error(`[TMDB Collection] Invalid collection id format: ${id}`), { status: 400 });
     }
 
     const catalogConfig = config.catalogs?.find(c => c.id === id && c.type === type)
@@ -1328,7 +1383,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       let parts = Array.isArray(collection?.parts) ? [...collection.parts] : [];
       if (!parts.length) {
         logger.info(`[TMDB Collection] Collection ${collectionId} has no parts`);
-        return [];
+        return attachProviderPageInfo([], { rawCount: 0, hasMore: false, total: 0 });
       }
 
       if (config.sfw || !config.includeAdult) {
@@ -1347,7 +1402,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
         } else {
           logger.warn(`[TMDB Collection] Genre "${genre}" not found`);
         }
-        if (!parts.length) return [];
+        if (!parts.length) return attachProviderPageInfo([], { rawCount: 0, hasMore: false, total: 0 });
       }
 
       // TMDB returns parts in no particular order: the Bond collection starts at 1973.
@@ -1361,7 +1416,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       const pageSize = catalogRequestPageSize();
       const pageNum = typeof page === 'number' ? page : parseInt(String(page), 10) || 1;
       const pageParts = parts.slice((pageNum - 1) * pageSize, (pageNum - 1) * pageSize + pageSize);
-      if (!pageParts.length) return [];
+      if (!pageParts.length) return attachProviderPageInfo([], { rawCount: 0, hasMore: false, total: parts.length });
 
       const metas = await mapWithLimit(pageParts, async (part: any) => {
         const stremioId = `tmdb:${part.id}`;
@@ -1378,10 +1433,14 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
 
       const validMetas = metas.filter((meta: any) => meta !== null);
       logger.success(`[TMDB Collection] Processed ${validMetas.length} items for ${id} (page ${pageNum})`);
-      return validMetas;
+      return attachProviderPageInfo(validMetas, {
+        rawCount: pageParts.length,
+        hasMore: pageNum * pageSize < parts.length,
+        total: parts.length,
+      });
     } catch (error: any) {
       logger.error(`[TMDB Collection] Error fetching collection ${collectionId}: ${error.message}`);
-      return [];
+      throw error;
     }
   }
 
@@ -1394,7 +1453,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
     
     if (!tmdbApiKey) {
       logger.warn('[TMDB List] Missing API key');
-      return [];
+      throw Object.assign(new Error('TMDB authentication required'), { status: 401 });
     }
     
     // Formats: tmdb.list.{listId} or tmdb.list.{listId}.movies or tmdb.list.{listId}.series
@@ -1404,8 +1463,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
     const isSplit = parts.length === 4; // tmdb.list.{listId}.movies or tmdb.list.{listId}.series
     
     if (!listId) {
-      logger.error(`[TMDB List] Invalid list ID format: ${id}`);
-      return [];
+      throw Object.assign(new Error(`[TMDB List] Invalid list ID format: ${id}`), { status: 400 });
     }
     
     try {
@@ -1418,7 +1476,11 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       
       if (!result || !result.items || result.items.length === 0) {
         logger.info(`[TMDB List] No items found for list ${listId} at page ${pageNum}`);
-        return [];
+        return attachProviderPageInfo([], {
+          rawCount: 0,
+          hasMore: false,
+          total: result?.total_results || 0,
+        });
       }
       
       logger.info(`[TMDB List] Fetched ${result.items.length} items from list ${listId}`);
@@ -1488,11 +1550,15 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       let validMetas = metas.filter(meta => meta !== null);
 
       logger.success(`[TMDB List] Processed ${validMetas.length} items for list ${listId}`);
-      return validMetas;
+      return attachProviderPageInfo(validMetas, {
+        rawCount: result.items.length,
+        hasMore: pageNum < (result.total_pages || 1),
+        total: result.total_results,
+      });
       
     } catch (error: any) {
       logger.error(`[TMDB List] Error fetching list ${listId}: ${error.message}`);
-      return [];
+      throw error;
     }
   }
 
@@ -1550,9 +1616,13 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
 
   let validMetas = metas.filter(meta => meta !== null);
   
-  return validMetas;
+  return attachProviderPageInfo(validMetas, {
+    rawCount: res.results.length,
+    hasMore: Number(res.page || page) < Number(res.total_pages || 1),
+    total: res.total_results,
+  });
   } else {
-    return [];
+    return attachProviderPageInfo([], { rawCount: 0, hasMore: false, total: 0 });
   }
 }
 
@@ -1994,14 +2064,13 @@ async function getExternalAddonCatalog(type: string, catalogId: string, genre: s
   try {
     const userCatalog = config.catalogs?.find(c => c.id === catalogId && c.type === type);
     if (!userCatalog || (!userCatalog.sourceUrl && !userCatalog.source)) {
-      logger.error(`[External Addon] No source URL found for catalog: ${catalogId}`);
-      return [];
+      throw Object.assign(new Error(`[External Addon] No source URL found for catalog: ${catalogId}`), { status: 400 });
     }
 
     const catalogUrl = userCatalog.sourceUrl || userCatalog.source;
     const catalogTTL = userCatalog.cacheTTL ?? parseInt(process.env.CATALOG_TTL || String(24 * 60 * 60), 10);
     const batchSize = catalogRequestPageSize();
-    const useCursor = skip !== undefined && redis;
+    const useCursor = false;
     const stremioSkip = skip ?? (page - 1) * batchSize;
 
     const cursorKey = useCursor ? `catalog-cursor:${userUUID}:${catalogId}:${type}:${genre || 'all'}` : null;
@@ -2033,13 +2102,8 @@ async function getExternalAddonCatalog(type: string, catalogId: string, genre: s
 
     logger.info(`[External Addon] ${catalogId}: type=${type}, stremioSkip=${stremioSkip}, upstreamSkip=${upstreamSkip}, genre=${genre || 'none'}`);
 
-    // Filter here (not at the catalog route) so the pagination cursor below counts
-    // post-filter items. The route detects this via filtersAlreadyApplied and skips re-filtering.
-    const { applyCatalogFilters, catalogFiltersActive } = require('../utils/catalogFilters.js');
-    const { fillMaxPages } = require('./catalogPagination');
-
     const readBatch = async (offset: number) => {
-      const cacheKey = `custom-batch:${catalogId}:${genre || 'all'}:skip=${offset}`;
+      const cacheKey = `custom-batch:v2:${catalogId}:${genre || 'all'}:skip=${offset}`;
       return await cacheWrap(cacheKey, async () => {
         return await fetchStremThruCatalog(catalogUrl, offset, genre);
       }, catalogTTL, { enableErrorCaching: true, maxRetries: 2 });
@@ -2049,21 +2113,21 @@ async function getExternalAddonCatalog(type: string, catalogId: string, genre: s
     let offset = upstreamSkip;
     let batchesRead = 0;
 
-    const filtersActive = catalogFiltersActive({ config, catalogConfig: userCatalog, cleanId: catalogId });
-    const maxBatches = Math.max(filtersActive ? fillMaxPages() : 1, batchSize);
+    const maxBatches = 1;
+    let upstreamExhausted = false;
 
     while (collected.length < batchSize && batchesRead < maxBatches) {
       const items = await readBatch(offset);
       batchesRead += 1;
       if (!items?.length) {
         logger.debug(`[External Addon] No items returned for ${catalogId} at skip=${offset}`);
+        upstreamExhausted = true;
         break;
       }
 
       for (let i = 0; i < items.length; i += batchSize) {
         const chunk = items.slice(i, i + batchSize);
         let metas = await parseStremThruItems(chunk, type, genre, language, config, includeVideos);
-        metas = await applyCatalogFilters(metas, { type, config, catalogConfig: userCatalog, cleanId: catalogId });
         for (const meta of metas) {
           const id = meta?.id;
           if (id && seenIds.has(id)) continue;
@@ -2086,11 +2150,14 @@ async function getExternalAddonCatalog(type: string, catalogId: string, genre: s
     }
 
     logger.success(`[External Addon] ${catalogId}: ${collected.length} items from ${batchesRead} batch(es) (stremioSkip=${stremioSkip}, nextUpstream=${offset})`);
-    return collected;
+    return attachProviderPageInfo(collected, {
+      rawCount: offset - upstreamSkip,
+      exhaustion: upstreamExhausted ? 'confirmed' : 'unknown',
+    });
 
   } catch (err: any) {
     logger.error(`[External Addon] Error processing catalog ${catalogId}: ${err.message}`);
-    return [];
+    throw err;
   }
 }
 
@@ -2161,7 +2228,7 @@ async function getTraktCatalog(
       } else {
         const token = await ensureTraktAccessToken();
         if (!token) {
-          return [];
+          throw Object.assign(new Error('Trakt authentication required'), { status: 401 });
         }
 
         const upNextStart = Date.now();
@@ -2222,7 +2289,7 @@ async function getTraktCatalog(
       } else {
         const token = await ensureTraktAccessToken();
         if (!token) {
-          return [];
+          throw Object.assign(new Error('Trakt authentication required'), { status: 401 });
         }
 
         const runStart = Date.now();
@@ -2264,7 +2331,7 @@ async function getTraktCatalog(
       } else {
         const token = await ensureTraktAccessToken();
         if (!token) {
-          return [];
+          throw Object.assign(new Error('Trakt authentication required'), { status: 401 });
         }
 
         // Get timezone from config or default to UTC
@@ -2302,8 +2369,7 @@ async function getTraktCatalog(
       // Example: trakt.most_favorited.movies.weekly
       const parts = catalogId.split('.');
       if (parts.length !== 4) {
-        logger.error(`Invalid Trakt most_favorited ID format: ${catalogId}`);
-        return [];
+        throw Object.assign(new Error(`Invalid Trakt most_favorited ID format: ${catalogId}`), { status: 400 });
       }
       const favType = parts[2]; // 'movies' or 'shows'
       const favPeriod = parts[3]; // 'daily', 'weekly', 'monthly', 'all'
@@ -2337,7 +2403,7 @@ async function getTraktCatalog(
       // Unified watchlist
       const token = await ensureTraktAccessToken();
       if (!token) {
-        return [];
+        throw Object.assign(new Error('Trakt authentication required'), { status: 401 });
       }
       logger.debug(`Fetching Trakt unified watchlist`);
       response = await fetchTraktWatchlistItems(token, undefined, page, pageSize, sort, sortDirection, genreSlug, catalogConfig?.cacheTTL);
@@ -2345,7 +2411,7 @@ async function getTraktCatalog(
       // Movies-only watchlist
       const token = await ensureTraktAccessToken();
       if (!token) {
-        return [];
+        throw Object.assign(new Error('Trakt authentication required'), { status: 401 });
       }
       logger.debug(`Fetching Trakt watchlist (movies only)`);
       response = await fetchTraktWatchlistItems(token, 'movies', page, pageSize, sort, sortDirection, genreSlug, catalogConfig?.cacheTTL);
@@ -2353,7 +2419,7 @@ async function getTraktCatalog(
       // Series-only watchlist
       const token = await ensureTraktAccessToken();
       if (!token) {
-        return [];
+        throw Object.assign(new Error('Trakt authentication required'), { status: 401 });
       }
       logger.debug(`Fetching Trakt watchlist (shows only)`);
       response = await fetchTraktWatchlistItems(token, 'shows', page, pageSize, sort, sortDirection, genreSlug, catalogConfig?.cacheTTL);
@@ -2361,7 +2427,7 @@ async function getTraktCatalog(
       // Movies-only favorites
       const token = await ensureTraktAccessToken();
       if (!token) {
-        return [];
+        throw Object.assign(new Error('Trakt authentication required'), { status: 401 });
       }
       logger.debug(`Fetching Trakt favorites (movies only)`);
       response = await fetchTraktFavoritesItems(token, 'movies', page, pageSize, sort, sortDirection, genreSlug, catalogConfig?.cacheTTL);
@@ -2369,7 +2435,7 @@ async function getTraktCatalog(
       // Shows-only favorites
       const token = await ensureTraktAccessToken();
       if (!token) {
-        return [];
+        throw Object.assign(new Error('Trakt authentication required'), { status: 401 });
       }
       logger.debug(`Fetching Trakt favorites (shows only)`);
       response = await fetchTraktFavoritesItems(token, 'shows', page, pageSize, sort, sortDirection, genreSlug, catalogConfig?.cacheTTL);
@@ -2377,7 +2443,7 @@ async function getTraktCatalog(
       // Movies-only recommendations
       const token = await ensureTraktAccessToken();
       if (!token) {
-        return [];
+        throw Object.assign(new Error('Trakt authentication required'), { status: 401 });
       }
       logger.debug(`Fetching Trakt recommendations (movies only)`);
       response = await fetchTraktRecommendationsItems(token, 'movies', page, 50, catalogConfig?.cacheTTL);
@@ -2385,7 +2451,7 @@ async function getTraktCatalog(
       // Shows-only recommendations
       const token = await ensureTraktAccessToken();
       if (!token) {
-        return [];
+        throw Object.assign(new Error('Trakt authentication required'), { status: 401 });
       }
       logger.debug(`Fetching Trakt recommendations (shows only)`);
       response = await fetchTraktRecommendationsItems(token, 'shows', page, 50, catalogConfig?.cacheTTL);
@@ -2395,8 +2461,7 @@ async function getTraktCatalog(
       // - trakt.<username>.<listSlug>  (legacy/backwards-compatible)
       const parts = catalogId.split('.');
       if (parts.length < 3) {
-        logger.error(`Invalid Trakt list ID format: ${catalogId}`);
-        return [];
+        throw Object.assign(new Error(`Invalid Trakt list ID format: ${catalogId}`), { status: 400 });
       }
 
       const privacy = catalogConfig?.metadata?.privacy || 'public';
@@ -2406,7 +2471,7 @@ async function getTraktCatalog(
         : (await ensureTraktAccessToken() || '');
 
       if (privacy !== 'public' && !listAccessToken) {
-        return [];
+        throw Object.assign(new Error('Trakt authentication required for private list'), { status: 401 });
       }
 
       if (parts[1] === 'list') {
@@ -2455,7 +2520,11 @@ async function getTraktCatalog(
     // Early exit for empty pages
     if (!response.hasMore && response.items.length === 0) {
       logger.debug(`Trakt early exit - no more items at page ${page}`);
-      return [];
+      return attachProviderPageInfo([], {
+        rawCount: 0,
+        hasMore: false,
+        total: response.totalItems,
+      });
     }
     
     const parseStart = Date.now();
@@ -2591,11 +2660,11 @@ async function getAniListCatalog(
     
     if (!username) {
       logger.error(`[AniList] No username found in catalog config for: ${catalogId}`);
-      return [];
+      throw Object.assign(new Error(`[AniList] No username found in catalog config for: ${catalogId}`), { status: 400 });
     }
     if (!listName) {
       logger.error(`[AniList] No list name resolved for catalog: ${catalogId}`);
-      return [];
+      throw Object.assign(new Error(`[AniList] No list name resolved for catalog: ${catalogId}`), { status: 400 });
     }
     
     const pageSize = 50;
@@ -2747,14 +2816,12 @@ async function getMalUserListCatalog(
     const isSuggestions = catalogId === 'mal.suggestions';
     const status = catalogId.replace('mal.userlist.', '');
     if (!isSuggestions && !malTracker.MAL_USERLIST_STATUSES.includes(status)) {
-      logger.error(`[MAL] Unknown user list status for catalog: ${catalogId}`);
-      return [];
+      throw Object.assign(new Error(`[MAL] Unknown user list status for catalog: ${catalogId}`), { status: 400 });
     }
 
     const accessToken = await malTracker.getValidAccessToken(userUUID);
     if (!accessToken) {
-      logger.warn(`[MAL] No valid access token for user ${userUUID} (catalog: ${catalogId})`);
-      return [];
+      throw Object.assign(new Error(`[MAL] No valid access token for user ${userUUID}`), { status: 401 });
     }
 
     const catalogConfig = config.catalogs?.find(c => c.id === catalogId);
@@ -2769,7 +2836,10 @@ async function getMalUserListCatalog(
     logger.debug(`[MAL] Fetched ${response.items.length} items from "${isSuggestions ? 'suggestions' : status}", hasMore: ${response.hasMore}`);
 
     if (response.items.length === 0) {
-      return [];
+      return attachProviderPageInfo([], {
+        rawCount: 0,
+        hasMore: response.hasMore,
+      });
     }
 
     const newItems = response.items.map((item: any) => {
@@ -2830,8 +2900,7 @@ async function getLetterboxdCatalog(
     const identifier = catalogId.replace('letterboxd.', '');
     
     if (!identifier) {
-      logger.error(`Invalid Letterboxd catalog ID: ${catalogId}`);
-      return [];
+      throw Object.assign(new Error(`Invalid Letterboxd catalog ID: ${catalogId}`), { status: 400 });
     }
 
     // Find catalog config to determine if it's a watchlist
@@ -2851,7 +2920,7 @@ async function getLetterboxdCatalog(
     
     if (!listData?.data?.items) {
       logger.warn(`No items found in Letterboxd list: ${identifier}`);
-      return [];
+      return attachProviderPageInfo([], { rawCount: 0, hasMore: false, total: 0 });
     }
 
     const allItems = listData.data.items;
@@ -2869,7 +2938,7 @@ async function getLetterboxdCatalog(
 
     if (pageItems.length === 0) {
       logger.info(`No items on page ${page} for Letterboxd list ${identifier}`);
-      return [];
+      return attachProviderPageInfo([], { rawCount: 0, hasMore: false, total: filteredItems.length });
     }
 
     logger.debug(`Processing ${pageItems.length} items for page ${page}`);
@@ -3037,7 +3106,7 @@ async function getMovieLensCatalog(
   includeVideos: boolean = false
 ): Promise<any[]> {
   try {
-    if (type !== 'movie') return [];
+    if (type !== 'movie') return attachProviderPageInfo([], { rawCount: 0, hasMore: false });
     const credId = config.apiKeys?.movieLensCredId;
     if (!credId) {
       logger.warn(`[MovieLens] Catalog ${catalogId} requested but no MovieLens account is connected`);
@@ -3088,7 +3157,9 @@ async function getMovieLensCatalog(
       if (isList) {
         const listId = catalogId.slice('movielens.list.'.length);
         const listUserId = catalogConfig?.metadata?.listUserId;
-        if (!listUserId) return [];
+        if (!listUserId) {
+          throw Object.assign(new Error(`MovieLens list ${catalogId} has no list user id`), { status: 400 });
+        }
         const offset = (page - 1) * pageSize;
         const need = offset + pageSize;
         const maxListPages = parseInt(process.env.MOVIELENS_LIST_MAX_PAGES || '50', 10);
@@ -3156,7 +3227,7 @@ async function getSimklCatalog(
       const animeOnly = catalogId === 'simkl.upnext.anime';
       if (type === 'movie') {
         logger.info(`[Simkl Up Next] Type ${type} requested, returning empty (episodes only)`);
-        return [];
+        return attachProviderPageInfo([], { rawCount: 0, hasMore: false });
       }
 
       const tokenId = (config.apiKeys as any)?.simklTokenId;
@@ -3183,13 +3254,17 @@ async function getSimklCatalog(
       const pageItems = allItems.slice(startIndex, startIndex + pageSize);
       if (pageItems.length === 0) {
         logger.info(`[Simkl Up Next] No items at page ${page}`);
-        return [];
+        return attachProviderPageInfo([], { rawCount: 0, hasMore: false, total: allItems.length });
       }
 
       const useShowPoster = catalogConfig?.metadata?.useShowPosterForUpNext === true;
       const metas = await parseSimklUpNextItems(pageItems, config, userUUID, useShowPoster);
       logger.success(`[Simkl Up Next] Processed ${metas.length} items (page ${page}) in ${Date.now() - upNextStart}ms`);
-      return metas;
+      return attachProviderPageInfo(metas, {
+        rawCount: pageItems.length,
+        hasMore: startIndex + pageItems.length < allItems.length,
+        total: allItems.length,
+      });
     }
 
     let response: any;
@@ -3328,14 +3403,14 @@ async function getSimklCatalog(
         const tokenId = (config.apiKeys as any)?.simklTokenId;
         if (!tokenId) {
           logger.error(`[Simkl] No Simkl token ID found for watchlist catalog`);
-          return [];
+          throw Object.assign(new Error('Simkl authentication required'), { status: 401 });
         }
         
         const token = await getSimklToken(tokenId);
         const accessToken = token?.access_token;
         if (!accessToken) {
           logger.error(`[Simkl] Failed to get Simkl access token for watchlist catalog`);
-          return [];
+          throw Object.assign(new Error('Simkl authentication failed'), { status: 401 });
         }
         
         logger.debug(`[Simkl] Fetching watchlist ${watchlistType}/${status} (all items, local pagination)`);
@@ -3409,18 +3484,20 @@ async function getSimklCatalog(
         
         response = { items: paginatedItems, hasMore };
       } else {
-        logger.warn(`[Simkl] Invalid watchlist catalog ID format: ${catalogId}`);
-        return [];
+        throw Object.assign(new Error(`[Simkl] Invalid watchlist catalog ID format: ${catalogId}`), { status: 400 });
       }
     } else {
-      logger.warn(`[Simkl] Unknown catalog ID: ${catalogId}`);
-      return [];
+      throw Object.assign(new Error(`[Simkl] Unknown catalog ID: ${catalogId}`), { status: 400 });
     }
     
     // Early exit for empty pages
     if (!response.hasMore && response.items.length === 0) {
       logger.debug(`[Simkl] No more items at page ${page}`);
-      return [];
+      return attachProviderPageInfo([], {
+        rawCount: 0,
+        hasMore: false,
+        total: response.totalItems,
+      });
     }
     
     const isAnimeCatalog = catalogId === 'simkl.trending.anime'
@@ -3465,8 +3542,7 @@ async function getFlixPatrolCatalog(
 
     const parts = catalogId.split('.');
     if (parts.length < 4) {
-      logger.error(`Invalid FlixPatrol catalog ID: ${catalogId}`);
-      return [];
+      throw Object.assign(new Error(`Invalid FlixPatrol catalog ID: ${catalogId}`), { status: 400 });
     }
 
     const service = parts[1];
@@ -3482,7 +3558,9 @@ async function getFlixPatrolCatalog(
     let metas = await getFlixPatrolMetas(service, countrySlug, mediaType, language, config, includeVideos, variantId);
 
     logger.success(`[FlixPatrol] Processed ${metas.length} items for catalog ${catalogId}`);
-    return attachProviderPageInfo(metas, { rawCount: metas.length, hasMore: undefined });
+    const rawCount = (metas as any)._rawCount;
+    if (!Number.isInteger(rawCount)) throw new Error('FlixPatrol did not report its raw chart size');
+    return attachProviderPageInfo(metas, { rawCount, hasMore: undefined });
 
   } catch (err: any) {
     const errorLine = err.stack?.split('\n')[1]?.trim() || 'unknown';
@@ -3511,7 +3589,7 @@ async function getPublicMetaDBCatalog(
     const useShowPoster = catalogConfig?.metadata?.useShowPosterForUpNext ?? false;
 
     if (catalogId === 'publicmetadb.upnext') {
-      if (page > 1) return [];
+      if (page > 1) return attachProviderPageInfo([], { rawCount: 0, hasMore: false });
       const items = await fetchResume(apiKey);
       let metas = await parseResumeItems(items, type, language, config, useShowPoster);
       logger.success(`[PublicMetaDB] Up Next: ${metas.length} items`);
@@ -3533,7 +3611,7 @@ async function getPublicMetaDBCatalog(
 
     if (catalogId.startsWith('publicmetadb.pick.')) {
       const pickId = catalogId.replace('publicmetadb.pick.', '');
-      if (page > 5) return [];
+      if (page > 5) return attachProviderPageInfo([], { rawCount: 0, hasMore: false });
       const data = await fetchPickItems(apiKey, pickId, page);
       let metas = await parsePickItems(data.items || [], type, language, config);
       logger.success(`[PublicMetaDB] Pick ${pickId}: ${metas.length} items (page ${page})`);
@@ -3543,8 +3621,7 @@ async function getPublicMetaDBCatalog(
       });
     }
 
-    logger.warn(`[PublicMetaDB] Unknown catalog: ${catalogId}`);
-    return [];
+    throw Object.assign(new Error(`[PublicMetaDB] Unknown catalog: ${catalogId}`), { status: 400 });
   } catch (err: any) {
     logger.error(`[PublicMetaDB] Error processing catalog ${catalogId}: ${err.message}`);
     throw err;
@@ -3614,13 +3691,11 @@ async function getMergedCatalog(
 ): Promise<any[]> {
   const catalogConfig = config.catalogs?.find((c: any) => c.id === catalogId);
   if (!catalogConfig) {
-    logger.warn(`[Merged] Catalog config not found for ${catalogId}`);
-    return [];
+    throw Object.assign(new Error(`[Merged] Catalog config not found for ${catalogId}`), { status: 400 });
   }
   const sources = (catalogConfig as any).metadata?.mergedSources;
   if (!sources || sources.length === 0) {
-    logger.warn(`[Merged] No sources defined for ${catalogId}`);
-    return [];
+    throw Object.assign(new Error(`[Merged] No sources defined for ${catalogId}`), { status: 400 });
   }
   const mergeMode: string = (catalogConfig as any).metadata?.mergeMode || 'interleaved';
 
@@ -3638,7 +3713,9 @@ async function getMergedCatalog(
     }
     return true;
   });
-  if (validSources.length === 0) return [];
+  if (validSources.length === 0) {
+    throw Object.assign(new Error(`[Merged] No valid sources remain for ${catalogId}`), { status: 400 });
+  }
 
   const { applyCatalogFilters } = require('../utils/catalogFilters.js');
   const pageSize = catalogRequestPageSize();
@@ -3794,6 +3871,7 @@ async function getMergedCatalog(
   };
 
   const collected: any[] = [];
+  let totalRawConsumed = 0;
   const maxAttempts = 15;
   let attempts = 0;
 
@@ -3811,6 +3889,7 @@ async function getMergedCatalog(
       }
 
       const { items, rawLength } = await fetchSourcePage(src, srcPage);
+      totalRawConsumed += rawLength;
       const { added, consumed } = collectDeduped(items, collected);
       if (consumed >= items.length) {
         if (rawLength === 0 || (items.length > 0 && added === 0)) {
@@ -3847,6 +3926,7 @@ async function getMergedCatalog(
       consecutiveSkips = 0;
 
       const { items, rawLength } = await fetchSourcePage(src, srcPage);
+      totalRawConsumed += rawLength;
       const { added, consumed } = collectDeduped(items, collected);
       if (consumed >= items.length) {
         if (rawLength === 0 || (items.length > 0 && added === 0)) {
@@ -3873,6 +3953,7 @@ async function getMergedCatalog(
           return fetchSourcePage(src, srcPage);
         })
       );
+      totalRawConsumed += results.reduce((sum, result) => sum + result.rawLength, 0);
 
       const tagged = roundRobinInterleaveTagged(results.map(r => r.items));
       const { added, consumedPerSource } = collectDedupedTagged(
@@ -3922,7 +4003,10 @@ async function getMergedCatalog(
     `(skip=${stremioSkip}, seen=${seenIds.size}, mode=${mergeMode}` +
     `${hasGenreFilter ? `, genre="${genre}"` : ''})`
   );
-  return collected;
+  return attachProviderPageInfo(collected, {
+    rawCount: totalRawConsumed,
+    exhaustion: [...perSourcePage.values()].every(value => value <= 0) ? 'confirmed' : 'unknown',
+  });
 }
 
 export { getCatalog, fetchCatalogBatch };

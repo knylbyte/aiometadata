@@ -7,15 +7,20 @@ const {
   assembleCanonicalResponse,
   buildCanonicalCatalogCacheArgs,
   buildCatalogQuerySignature,
+  buildCatalogSourceQuerySignature,
+  buildDeliveryCursorSignature,
   hydrateCanonicalPageWindow,
   resolveCanonicalPageWindow,
 } = require('../dist/server/lib/catalogFetchPlanner.js');
 const {
   createCatalogSourceAdapter,
+  attachProviderPageMetadata,
   CATALOG_PROVIDER_REGISTRY,
   createFixedPageAdapter,
   getCatalogProviderDefinition,
+  providerPageResultFromHandler,
 } = require('../dist/server/lib/catalogSourceAdapter.js');
+const { fillFilteredPage } = require('../dist/server/lib/catalogPagination.js');
 const {
   clearProviderBatchCacheForTests,
   fetchProviderBatchCached,
@@ -227,7 +232,7 @@ test('an exact full batch with explicit exhaustion writes a terminal marker with
   assert.equal(result.exhausted, true);
   assert.equal(state.pages.get(1)._canonical.exhausted, true);
   assert.deepEqual(state.getTerminal(), {
-    schema: 'v5',
+    schema: 'v6',
     sourceEnd: { kind: 'offset', offset: 20 },
     lastCanonicalPage: 1,
   });
@@ -368,7 +373,7 @@ test('failed provider batches are not retained by the single-flight cache', asyn
 
 test('a terminal marker suppresses requests beyond the confirmed final page', async () => {
   const state = memoryState(new Map(), {
-    schema: 'v5',
+    schema: 'v6',
     sourceEnd: { kind: 'offset', offset: 125 },
     lastCanonicalPage: 7,
   });
@@ -417,11 +422,11 @@ test('fixed and cursor providers are fetched sequentially using adapter-native g
   }
 });
 
-test('v4 pages are not read as v5 and response limits do not fork canonical keys', async () => {
+test('v5 pages are not read as v6 and response limits do not fork canonical keys', async () => {
   const oldPage = {
     metas: metas(900, 20),
     _canonical: {
-      schema: 'v4', page: 1,
+      schema: 'v5', page: 1,
       sourceStart: { kind: 'offset', offset: 0 },
       sourceNext: { kind: 'offset', offset: 20 },
       exhausted: false, entryResumes: [],
@@ -445,7 +450,7 @@ test('v4 pages are not read as v5 and response limits do not fork canonical keys
     querySignature: 'query',
     resumeState: { kind: 'offset', offset: 0 },
     requestedUpstreamLimit: 20,
-  }).startsWith('provider-batch:v2:'), true);
+  }).startsWith('provider-batch:v3:'), true);
 });
 
 test('FlixPatrol Top 10 confirms EOF on its successful empty second page', async () => {
@@ -457,7 +462,12 @@ test('FlixPatrol Top 10 confirms EOF on its successful empty second page', async
     fetchPage: async page => {
       calls.push(page);
       const pageMetas = page === 1 ? metas(0, 10) : [];
-      return { metas: pageMetas, rawCount: pageMetas.length };
+      return {
+        metas: pageMetas,
+        rawCount: pageMetas.length,
+        resumeAfterBatch: { kind: 'page-index', page: page + 1, index: 0 },
+        exhaustion: page === 2 ? 'confirmed' : 'unknown',
+      };
     },
   });
   const state = memoryState();
@@ -476,7 +486,12 @@ test('a configured short fixed page confirms EOF without an extra empty request'
     fetchPage: async page => {
       calls.push(page);
       const pageMetas = page === 1 ? metas(0, 20) : metas(20, 7);
-      return { metas: pageMetas, rawCount: pageMetas.length };
+      return {
+        metas: pageMetas,
+        rawCount: pageMetas.length,
+        resumeAfterBatch: { kind: 'page-index', page: page + 1, index: 0 },
+        exhaustion: page === 2 ? 'confirmed' : 'not-exhausted',
+      };
     },
   });
   const capabilities = {
@@ -503,7 +518,13 @@ test('Trakt Recommendations uses native pages of 50 without losing IDs 20-49', a
     querySignature: 'trakt-recommendations', type: 'movie', language: 'en-US', useRedisBatchCache: false,
     fetchPage: async (page, nativePageSize) => {
       calls.push({ page, nativePageSize });
-      return { metas: metas((page - 1) * 50, 50), rawCount: 50, hasMore: page < 2 };
+      return {
+        metas: metas((page - 1) * 50, 50),
+        rawCount: 50,
+        hasMore: page < 2,
+        resumeAfterBatch: { kind: 'page-index', page: page + 1, index: 0 },
+        exhaustion: page < 2 ? 'not-exhausted' : 'confirmed',
+      };
     },
   });
   const state = memoryState();
@@ -515,7 +536,7 @@ test('Trakt Recommendations uses native pages of 50 without losing IDs 20-49', a
   assert.deepEqual(state.pages.get(4).metas.map(meta => meta.id), metas(60, 20).map(meta => meta.id));
 });
 
-test('every registered provider uses its declared fetch geometry and structured result contract', async () => {
+test('every registered fixed-page provider passes the real handler contract wrapper', async () => {
   for (const registryEntry of CATALOG_PROVIDER_REGISTRY) {
     clearProviderBatchCacheForTests();
     const definition = getCatalogProviderDefinition({ catalogId: registryEntry.testCatalogId, canonicalPageSize: 20 });
@@ -523,9 +544,19 @@ test('every registered provider uses its declared fetch geometry and structured 
     const adapter = createCatalogSourceAdapter({
       catalogId: registryEntry.testCatalogId, canonicalPageSize: 20,
       querySignature: `audit-${registryEntry.id}`, type: 'movie', language: 'en-US', useRedisBatchCache: false,
-      fetchPage: async (_page, nativePageSize) => {
+      fetchPage: async (page, nativePageSize) => {
         usedSize = nativePageSize;
-        return { metas: metas(0, nativePageSize), rawCount: nativePageSize, hasMore: false };
+        const handlerMetas = attachProviderPageMetadata(metas(0, nativePageSize), {
+          rawCount: nativePageSize,
+          hasMore: false,
+        });
+        return providerPageResultFromHandler({
+          catalogId: registryEntry.testCatalogId,
+          canonicalPageSize: 20,
+          page,
+          nativePageSize,
+          metas: handlerMetas,
+        });
       },
       fetchOffsetBatch: async (resumeState, requestedRawCount) => {
         usedSize = requestedRawCount;
@@ -571,4 +602,150 @@ test('fixed-page adapters reject naked arrays and propagate provider errors', as
     });
     await assert.rejects(() => adapter(1), error);
   }
+});
+
+test('transient seven-item delivery recovers without shifting canonical pages', async () => {
+  let recovered = false;
+  const raw = metas(0, 60);
+  const adapter = {
+    ...offsetAdapter(raw, []),
+    fetchBatch: async request => {
+      const offset = request.resumeState.offset;
+      if (!recovered) {
+        if (offset === 0) {
+          return {
+            entries: raw.slice(0, 7).map((meta, index) => ({
+              meta,
+              sourcePosition: { kind: 'offset', offset: index },
+              resumeAfter: { kind: 'offset', offset: index + 1 },
+            })),
+            rawCount: 7,
+            resumeAfterBatch: { kind: 'offset', offset: 7 },
+            exhaustion: 'unknown',
+          };
+        }
+        return {
+          entries: [],
+          rawCount: 0,
+          resumeAfterBatch: { kind: 'offset', offset: 7 },
+          exhaustion: 'unknown',
+        };
+      }
+      const slice = raw.slice(offset, offset + request.requestedRawCount);
+      return {
+        entries: slice.map((meta, index) => ({
+          meta,
+          sourcePosition: { kind: 'offset', offset: offset + index },
+          resumeAfter: { kind: 'offset', offset: offset + index + 1 },
+        })),
+        rawCount: slice.length,
+        resumeAfterBatch: { kind: 'offset', offset: offset + slice.length },
+        exhaustion: offset + slice.length >= raw.length ? 'confirmed' : 'not-exhausted',
+      };
+    },
+  };
+  const state = memoryState();
+  const transient = await hydrate(state, adapter, 0, 20);
+  assert.deepEqual(transient.pages.get(1).metas.map(meta => meta.id), metas(0, 7).map(meta => meta.id));
+  assert.equal(state.pages.size, 0);
+
+  recovered = true;
+  await hydrate(state, adapter, 7, 33);
+  assert.deepEqual(state.pages.get(1).metas.map(meta => meta.id), metas(0, 20).map(meta => meta.id));
+  assert.deepEqual(state.pages.get(2).metas.map(meta => meta.id), metas(20, 20).map(meta => meta.id));
+});
+
+test('limit seven plus canonical cache eviction reconstructs page one at its boundary', async () => {
+  const state = memoryState();
+  const adapter = offsetAdapter(metas(0, 60), []);
+  await hydrate(state, adapter, 0, 20);
+  const first = await fillFilteredPage({
+    startPage: 1,
+    pageSize: 7,
+    sourcePageSize: 20,
+    fetchPage: state.readPage,
+  });
+  assert.deepEqual(first.metas.map(meta => meta.id), metas(0, 7).map(meta => meta.id));
+  assert.equal(first.nextCanonicalPage, 1);
+  assert.equal(first.nextFilteredOffset, 7);
+
+  state.pages.delete(1);
+  await hydrate(state, adapter, 7, 20);
+  const resumed = await fillFilteredPage({
+    startPage: 1,
+    startOffset: 7,
+    pageSize: 13,
+    sourcePageSize: 20,
+    fetchPage: state.readPage,
+  });
+  assert.deepEqual(state.pages.get(1).metas.map(meta => meta.id), metas(0, 20).map(meta => meta.id));
+  assert.deepEqual(resumed.metas.map(meta => meta.id), metas(7, 13).map(meta => meta.id));
+});
+
+test('filtered delivery cursor preserves the canonical source index after eviction', async () => {
+  const state = memoryState();
+  const adapter = offsetAdapter(metas(0, 60), []);
+  await hydrate(state, adapter, 0, 20);
+  const filterEntries = entries => entries.filter(entry => Number(entry.meta.id.slice(3)) >= 10);
+  const first = await fillFilteredPage({
+    startPage: 1,
+    pageSize: 5,
+    sourcePageSize: 20,
+    fetchPage: state.readPage,
+    filterEntries,
+  });
+  assert.deepEqual(first.metas.map(meta => meta.id), metas(10, 5).map(meta => meta.id));
+  assert.equal(first.lastServedCanonicalIndex, 14);
+  assert.deepEqual(first.sourceResumeAfterLastServed, { kind: 'offset', offset: 15 });
+  assert.equal(first.nextFilteredOffset, 5);
+
+  state.pages.delete(1);
+  await hydrate(state, adapter, 0, 20);
+  const resumed = await fillFilteredPage({
+    startPage: 1,
+    startOffset: first.nextFilteredOffset,
+    pageSize: 5,
+    sourcePageSize: 20,
+    fetchPage: state.readPage,
+    filterEntries,
+  });
+  assert.deepEqual(state.pages.get(1).metas.map(meta => meta.id), metas(0, 20).map(meta => meta.id));
+  assert.deepEqual(resumed.metas.map(meta => meta.id), metas(15, 5).map(meta => meta.id));
+});
+
+test('local filter changes reuse source pages but invalidate delivery cursors', () => {
+  const base = {
+    catalogId: 'tmdb.trending',
+    type: 'movie',
+    language: 'en-US',
+    canonicalPageSize: 20,
+    args: { genre: 'Drama' },
+  };
+  const withoutHide = buildCatalogSourceQuerySignature({
+    ...base,
+    catalogConfig: { metadata: { hideWatchedTrakt: false } },
+    configFingerprint: { sfw: false },
+  });
+  const withHide = buildCatalogSourceQuerySignature({
+    ...base,
+    catalogConfig: { metadata: { hideWatchedTrakt: true } },
+    configFingerprint: { sfw: false },
+  });
+  assert.equal(withoutHide, withHide);
+  assert.deepEqual(
+    buildCanonicalCatalogCacheArgs({ genre: 'Drama' }, 1, 20, withoutHide),
+    buildCanonicalCatalogCacheArgs({ genre: 'Drama' }, 1, 20, withHide)
+  );
+  assert.notEqual(
+    buildDeliveryCursorSignature({
+      sourceQuerySignature: withoutHide,
+      config: { hideWatchedTrakt: false },
+      catalogConfig: { metadata: { hideWatchedTrakt: false } },
+    }),
+    buildDeliveryCursorSignature({
+      sourceQuerySignature: withHide,
+      config: { hideWatchedTrakt: true },
+      catalogConfig: { metadata: { hideWatchedTrakt: true } },
+    })
+  );
 });

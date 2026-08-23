@@ -1,5 +1,6 @@
 import redis from './redisClient';
-import type { CanonicalTerminalState, ProviderResumeState } from './catalogFetchPlanner';
+import type { CanonicalCatalogPage, CanonicalTerminalState, ProviderResumeState } from './catalogFetchPlanner';
+import { capRedisTtl } from './catalogTtl';
 
 export interface CatalogCursor {
   served: number;
@@ -8,11 +9,15 @@ export interface CatalogCursor {
   responseLimit?: number;
   canonicalPage?: number;
   canonicalOffset?: number;
+  filteredOffset?: number;
+  canonicalSourceStart?: ProviderResumeState;
+  itemResumeAfterServed?: ProviderResumeState;
+  deliverySignature?: string;
   sourceResume?: ProviderResumeState;
 }
 
-const CURSOR_PREFIX = 'catalog-cursor:v5';
-const TERMINAL_PREFIX = 'canonical-terminal:v5';
+const CURSOR_PREFIX = 'catalog-cursor:v6';
+const TERMINAL_PREFIX = 'canonical-terminal:v6';
 
 function segment(value: unknown): string {
   return encodeURIComponent(String(value ?? ''));
@@ -60,9 +65,7 @@ export async function readCatalogTerminal(key: string, ttl?: number): Promise<Ca
   if (!raw) return null;
   try {
     const value = JSON.parse(raw) as CanonicalTerminalState;
-    if (Number.isFinite(ttl) && ttl! > 0 && typeof (redis as any).expire === 'function') {
-      await (redis as any).expire(key, Math.floor(ttl!));
-    }
+    if (Number.isFinite(ttl) && ttl! > 0) await capRedisTtl(redis as any, key, Math.floor(ttl!));
     return value;
   } catch {
     await redis.del(key);
@@ -88,7 +91,7 @@ export async function resolveStartPage(
   if (cursor && cursor.served === skip) {
     return {
       startPage: Math.max(1, cursor.canonicalPage || cursor.upstreamPage || 1),
-      startOffset: Math.max(0, cursor.canonicalOffset ?? cursor.pageOffset ?? 0),
+      startOffset: Math.max(0, cursor.filteredOffset ?? cursor.canonicalOffset ?? cursor.pageOffset ?? 0),
       matched: true,
     };
   }
@@ -109,9 +112,22 @@ export async function fillFilteredPage(options: {
   pageSize: number;
   sourcePageSize?: number;
   maxPages?: number;
-  fetchPage: (page: number) => Promise<any[]>;
-  filter: (items: any[]) => Promise<any[]> | any[];
-}): Promise<{ metas: any[]; nextPage: number; nextOffset: number; pagesRead: number; exhausted: boolean }> {
+  fetchPage: (page: number) => Promise<any[] | CanonicalCatalogPage>;
+  filter?: (items: any[]) => Promise<any[]> | any[];
+  filterEntries?: (entries: CanonicalDeliveryEntry[]) => Promise<CanonicalDeliveryEntry[]> | CanonicalDeliveryEntry[];
+}): Promise<{
+  metas: any[];
+  nextPage: number;
+  nextOffset: number;
+  nextCanonicalPage: number;
+  nextFilteredOffset: number;
+  pagesRead: number;
+  exhausted: boolean;
+  lastServedCanonicalIndex?: number;
+  sourceResumeAfterLastServed?: ProviderResumeState;
+  canonicalPageSourceStart?: ProviderResumeState;
+  transient: boolean;
+}> {
   const pageSize = Math.max(1, options.pageSize);
   const sourcePageSize = Math.max(1, options.sourcePageSize || pageSize);
   const maxPages = Math.max(1, options.maxPages || fillMaxPages());
@@ -120,29 +136,93 @@ export async function fillFilteredPage(options: {
   let offset = Math.max(0, options.startOffset || 0);
   let pagesRead = 0;
   let exhausted = false;
+  let lastServedCanonicalIndex: number | undefined;
+  let sourceResumeAfterLastServed: ProviderResumeState | undefined;
+  let canonicalPageSourceStart: ProviderResumeState | undefined;
+  let transient = false;
 
   while (metas.length < pageSize && pagesRead < maxPages) {
-    const raw = await options.fetchPage(page);
+    const fetched = await options.fetchPage(page);
     pagesRead += 1;
+    const canonical = !Array.isArray(fetched) && fetched && Array.isArray(fetched.metas)
+      ? fetched as CanonicalCatalogPage
+      : null;
+    const raw = canonical ? canonical.metas : fetched as any[];
     if (!raw || raw.length === 0) {
       exhausted = true;
       offset = 0;
       page += 1;
       break;
     }
-    const available = (await options.filter(raw)).slice(offset);
+    const entries: CanonicalDeliveryEntry[] = raw.map((meta, canonicalIndex) => ({
+      meta,
+      canonicalIndex,
+      sourcePosition: canonical
+        ? (canonicalIndex === 0
+            ? canonical._canonical.sourceStart
+            : canonical._canonical.entryResumes[canonicalIndex - 1])
+        : undefined,
+      resumeAfter: canonical?._canonical.entryResumes[canonicalIndex],
+    }));
+    let filteredEntries: CanonicalDeliveryEntry[];
+    if (options.filterEntries) {
+      filteredEntries = await options.filterEntries(entries);
+    } else {
+      const filteredMetas = options.filter ? await options.filter(raw) : raw;
+      const wanted = new Map<any, number>();
+      for (const meta of filteredMetas) wanted.set(meta, (wanted.get(meta) || 0) + 1);
+      filteredEntries = entries.filter(entry => {
+        const count = wanted.get(entry.meta) || 0;
+        if (count <= 0) return false;
+        wanted.set(entry.meta, count - 1);
+        return true;
+      });
+    }
+    const available = filteredEntries.slice(offset);
     const taken = available.slice(0, pageSize - metas.length);
-    metas.push(...taken);
+    metas.push(...taken.map(entry => entry.meta));
+    const last = taken[taken.length - 1];
+    if (last) {
+      lastServedCanonicalIndex = last.canonicalIndex;
+      sourceResumeAfterLastServed = last.resumeAfter;
+      canonicalPageSourceStart = canonical?._canonical.sourceStart;
+    }
     if (taken.length < available.length) {
       offset += taken.length;
       break;
     }
+    if (canonical?._canonical.transient) {
+      offset = filteredEntries.length;
+      canonicalPageSourceStart = canonical._canonical.sourceStart;
+      transient = true;
+      break;
+    }
     offset = 0;
     page += 1;
-    if (raw.length < sourcePageSize) {
+    if (canonical) canonicalPageSourceStart = canonical._canonical.sourceNext;
+    if (canonical?._canonical.exhausted || (!canonical && raw.length < sourcePageSize)) {
       exhausted = true;
       break;
     }
   }
-  return { metas, nextPage: page, nextOffset: offset, pagesRead, exhausted };
+  return {
+    metas,
+    nextPage: page,
+    nextOffset: offset,
+    nextCanonicalPage: page,
+    nextFilteredOffset: offset,
+    pagesRead,
+    exhausted,
+    lastServedCanonicalIndex,
+    sourceResumeAfterLastServed,
+    canonicalPageSourceStart,
+    transient,
+  };
+}
+
+export interface CanonicalDeliveryEntry {
+  meta: any;
+  canonicalIndex: number;
+  sourcePosition?: ProviderResumeState;
+  resumeAfter?: ProviderResumeState;
 }

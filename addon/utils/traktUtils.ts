@@ -2407,7 +2407,7 @@ async function fetchTraktCalendarShows(
       return { items: uniqueItems };
     } catch (err: any) {
       logger.error(`Error fetching Trakt calendar shows:`, err.message);
-      return { items: [] };
+      throw err;
     }
   }, ttl);
 }
@@ -2606,7 +2606,7 @@ async function fetchTraktMostFavoritedItems(
   genre?: string,
   cacheTTL?: number
 ): Promise<{items: any[], totalItems?: number, hasMore: boolean, totalPages?: number}> {
-  const cacheKey = `trakt-api:most-favorited:${type}:${period}:${page}:${limit}:${genre || ''}`;
+  const cacheKey = `trakt-api:most-favorited:v2:${type}:${period}:${page}:${limit}:${genre || ''}`;
   
   const ttl = cacheTTL !== undefined ? cacheTTL : parseInt(process.env.CATALOG_TTL || String(1 * 24 * 60 * 60), 10);
   
@@ -2663,7 +2663,7 @@ async function fetchTraktMostFavoritedItems(
       };
     } catch (err: any) {
       logger.error(`Error fetching Trakt most favorited ${type} for period ${period}, page ${page}:`, err.message);
-      return { items: [], hasMore: false };
+      throw err;
     }
   }, ttl, { upstream: true });
 }

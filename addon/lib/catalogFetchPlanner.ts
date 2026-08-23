@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
-export const CATALOG_CANONICAL_CACHE_VERSION = 'canonical-v5';
-export const CATALOG_CANONICAL_PAGE_SCHEMA = 'v5';
+export const CATALOG_CANONICAL_CACHE_VERSION = 'canonical-v6';
+export const CATALOG_CANONICAL_PAGE_SCHEMA = 'v6';
 
 export type CatalogExhaustion = 'confirmed' | 'not-exhausted' | 'unknown';
 
@@ -77,7 +77,7 @@ export interface MissingPageRange {
 export interface CanonicalCatalogPage {
   metas: any[];
   _canonical: {
-    schema: 'v5';
+    schema: 'v6';
     page: number;
     sourceStart: ProviderResumeState;
     sourceNext: ProviderResumeState;
@@ -88,9 +88,15 @@ export interface CanonicalCatalogPage {
 }
 
 export interface CanonicalTerminalState {
-  schema: 'v5';
+  schema: 'v6';
   sourceEnd: ProviderResumeState;
   lastCanonicalPage: number;
+}
+
+export interface CanonicalBoundaryAnchor {
+  afterCanonicalPage: number;
+  resumeState: ProviderResumeState;
+  boundary: true;
 }
 
 export class CatalogProviderNoProgressError extends Error {
@@ -104,13 +110,38 @@ function positiveInteger(value: number, fallback: number): number {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
-function stableValue(value: any, omitCachePolicy: boolean = false): any {
-  if (Array.isArray(value)) return value.map(child => stableValue(child, omitCachePolicy));
+const DELIVERY_ONLY_KEYS = new Set([
+  'skip',
+  'limit',
+  'page',
+  '_pageSize',
+  '_pageOffset',
+  '_catalogPaging',
+  '_canonicalPageSize',
+  '_querySignature',
+  '_mdblistPaging',
+  'ageRating',
+  'allowUnratedContent',
+  'hideUnreleasedDigital',
+  'hideUnreleasedShows',
+  'hideWatched',
+  'hideWatchedTrakt',
+  'hideWatchedAnilist',
+  'hideWatchedMdblist',
+  'hideWatchedSimkl',
+  'exclusionKeywords',
+  'regexExclusionFilter',
+  'exclusionGenres',
+  'randomizePerPage',
+]);
+
+function stableValue(value: any, omittedKeys: Set<string> = new Set()): any {
+  if (Array.isArray(value)) return value.map(child => stableValue(child, omittedKeys));
   if (value && typeof value === 'object') {
     return Object.keys(value).sort().reduce((result: Record<string, any>, key) => {
-      if (omitCachePolicy && key === 'cacheTTL') return result;
+      if (omittedKeys.has(key)) return result;
       const child = value[key];
-      if (child !== undefined && typeof child !== 'function') result[key] = stableValue(child, omitCachePolicy);
+      if (child !== undefined && typeof child !== 'function') result[key] = stableValue(child, omittedKeys);
       return result;
     }, {});
   }
@@ -121,7 +152,7 @@ export function stableCatalogStringify(value: any): string {
   return JSON.stringify(stableValue(value));
 }
 
-export function buildCatalogQuerySignature(input: {
+export function buildCatalogSourceQuerySignature(input: {
   catalogId: string;
   type: string;
   language?: string;
@@ -131,25 +162,45 @@ export function buildCatalogQuerySignature(input: {
   configFingerprint?: unknown;
 }): string {
   const args = { ...(input.args || {}) };
-  for (const key of [
-    'skip',
-    'limit',
-    'page',
-    '_pageSize',
-    '_pageOffset',
-    '_catalogPaging',
-    '_canonicalPageSize',
-    '_querySignature',
-    '_mdblistPaging',
-  ]) delete (args as any)[key];
+  for (const key of DELIVERY_ONLY_KEYS) delete (args as any)[key];
+  const sourceOmissions = new Set([...DELIVERY_ONLY_KEYS, 'cacheTTL']);
   const payload = {
     catalogId: input.catalogId,
     type: input.type,
     language: input.language || '',
     canonicalPageSize: positiveInteger(input.canonicalPageSize, 20),
     args,
-    catalogConfig: input.catalogConfig ? stableValue(input.catalogConfig, true) : null,
-    configFingerprint: input.configFingerprint || null,
+    catalogConfig: input.catalogConfig ? stableValue(input.catalogConfig, sourceOmissions) : null,
+    configFingerprint: input.configFingerprint ? stableValue(input.configFingerprint, sourceOmissions) : null,
+  };
+  return createHash('sha256').update(stableCatalogStringify(payload)).digest('hex').slice(0, 32);
+}
+
+export const buildCatalogQuerySignature = buildCatalogSourceQuerySignature;
+
+export function buildDeliveryCursorSignature(input: {
+  sourceQuerySignature: string;
+  config?: any;
+  catalogConfig?: any;
+  activityFingerprints?: unknown;
+}): string {
+  const config = input.config || {};
+  const metadata = input.catalogConfig?.metadata || {};
+  const payload = {
+    sourceQuerySignature: input.sourceQuerySignature,
+    ageRating: config.ageRating ?? null,
+    allowUnratedContent: config.allowUnratedContent ?? config.allowUnrated ?? null,
+    hideUnreleasedDigital: metadata.hideUnreleasedDigital ?? config.hideUnreleasedDigital ?? false,
+    hideUnreleasedShows: metadata.hideUnreleasedShows ?? config.hideUnreleasedShows ?? false,
+    hideWatchedTrakt: metadata.hideWatchedTrakt ?? config.hideWatchedTrakt ?? false,
+    hideWatchedAnilist: metadata.hideWatchedAnilist ?? config.hideWatchedAnilist ?? false,
+    hideWatchedMdblist: metadata.hideWatchedMdblist ?? config.hideWatchedMdblist ?? false,
+    hideWatchedSimkl: metadata.hideWatchedSimkl ?? config.hideWatchedSimkl ?? false,
+    exclusionKeywords: config.exclusionKeywords || '',
+    regexExclusionFilter: config.regexExclusionFilter || '',
+    exclusionGenres: config.exclusionGenres || '',
+    randomizePerPage: input.catalogConfig?.randomizePerPage === true,
+    activityFingerprints: input.activityFingerprints || null,
   };
   return createHash('sha256').update(stableCatalogStringify(payload)).digest('hex').slice(0, 32);
 }
@@ -226,7 +277,7 @@ export function buildCanonicalCatalogCacheArgs(
   querySignature?: string
 ): Record<string, unknown> {
   const normalized = { ...args };
-  for (const key of ['skip', 'limit', 'page', '_pageSize', '_pageOffset']) delete (normalized as any)[key];
+  for (const key of DELIVERY_ONLY_KEYS) delete (normalized as any)[key];
   normalized._catalogPaging = CATALOG_CANONICAL_CACHE_VERSION;
   normalized._canonicalPageSize = positiveInteger(canonicalPageSize, 20);
   if (querySignature) normalized._querySignature = querySignature;
@@ -234,7 +285,7 @@ export function buildCanonicalCatalogCacheArgs(
   return normalized;
 }
 
-export function isCanonicalV4Page(value: any, page?: number): value is CanonicalCatalogPage {
+export function isCanonicalPage(value: any, page?: number): value is CanonicalCatalogPage {
   return !!value
     && Array.isArray(value.metas)
     && value._canonical?.schema === CATALOG_CANONICAL_PAGE_SCHEMA
@@ -421,7 +472,7 @@ export async function hydrateCanonicalPageWindow(options: {
   fetchBatch?: (request: CatalogFetchBatch) => Promise<ProviderBatchResult>;
   readTerminal?: () => Promise<CanonicalTerminalState | null>;
   writeTerminal?: (terminal: CanonicalTerminalState) => Promise<void>;
-  sourceAnchor?: { canonicalPage: number; resumeState: ProviderResumeState };
+  sourceAnchor?: CanonicalBoundaryAnchor;
   dedupeKey?: (meta: any) => string | null | undefined;
   acceptEntry?: (entry: ReconstructedCatalogEntry) => Promise<boolean> | boolean;
   maxBatches?: number;
@@ -451,7 +502,7 @@ export async function hydrateCanonicalPageWindow(options: {
   const loadPage = async (page: number): Promise<CanonicalCatalogPage | null> => {
     if (loaded.has(page)) return loaded.get(page) || null;
     const value = await options.readPage(page);
-    const valid = isCanonicalV4Page(value, page) ? value : null;
+    const valid = isCanonicalPage(value, page) ? value : null;
     loaded.set(page, valid);
     if (valid) pages.set(page, valid);
     return valid;
@@ -466,9 +517,10 @@ export async function hydrateCanonicalPageWindow(options: {
   for (const range of ranges) {
     if (terminal && range.startPage > terminal.lastCanonicalPage) break;
     let anchor = await trustedAnchor({ startPage: range.startPage, initialResumeState, loadPage, dedupeKey });
-    if (anchor.page === 0 && options.sourceAnchor?.canonicalPage === range.startPage - 1
+    if (anchor.page === 0 && options.sourceAnchor?.boundary === true
+      && options.sourceAnchor.afterCanonicalPage === range.startPage - 1
       && isProviderResumeState(options.sourceAnchor.resumeState)) {
-      anchor = { page: options.sourceAnchor.canonicalPage, resume: options.sourceAnchor.resumeState, seen: new Set() };
+      anchor = { page: options.sourceAnchor.afterCanonicalPage, resume: options.sourceAnchor.resumeState, seen: new Set() };
     }
     let currentPage = anchor.page + 1;
     const targetEndPage = terminal
@@ -646,13 +698,13 @@ export async function resumeStateForCanonicalPosition(
   readPage: (page: number) => Promise<CanonicalCatalogPage | null>
 ): Promise<ProviderResumeState | undefined> {
   const current = await readPage(page);
-  if (current && isCanonicalV4Page(current, page)) {
+  if (current && isCanonicalPage(current, page)) {
     if (offset <= 0) return current._canonical.sourceStart;
     return current._canonical.entryResumes[offset - 1] || current._canonical.sourceNext;
   }
   if (offset === 0 && page > 1) {
     const previous = await readPage(page - 1);
-    if (previous && isCanonicalV4Page(previous, page - 1)) return previous._canonical.sourceNext;
+    if (previous && isCanonicalPage(previous, page - 1)) return previous._canonical.sourceNext;
   }
   return undefined;
 }

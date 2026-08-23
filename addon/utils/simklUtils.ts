@@ -1293,8 +1293,7 @@ async function fetchSimklRecipeItems(
 ): Promise<{ items: any[]; totalItems?: number; hasMore: boolean; totalPages?: number }> {
   const recipeFn = SIMKL_RECIPES[recipe];
   if (!recipeFn) {
-    logger.warn(`[Simkl] Unknown recipe: ${recipe}`);
-    return { items: [], hasMore: false };
+    throw Object.assign(new Error(`[Simkl] Unknown recipe: ${recipe}`), { status: 400 });
   }
 
   const full = await fetchSimklTrendingItems(type, interval, 1, 100000, cacheTTL);
@@ -1329,7 +1328,7 @@ async function fetchSimklGenreItems(
     const clientId = SIMKL_CLIENT_ID;
     if (!clientId) {
       logger.warn('[Simkl] Missing SIMKL_CLIENT_ID, cannot fetch discover genre items');
-      return { items: [], hasMore: false };
+      throw Object.assign(new Error('Simkl client configuration required'), { status: 401 });
     }
 
     const normalizedMedia = mediaType === 'shows' ? 'tv' : mediaType;
@@ -1351,7 +1350,7 @@ async function fetchSimklGenreItems(
     logger.debug(`[Simkl Discover] Fetching ${mediaType} genres endpoint: ${sanitizeUrlForLogging(endpointUrl)}`);
 
     const ttl = Math.max(cacheTTL || SIMKL_TRENDING_TTL, 3600);
-    const cacheKey = `simkl-discover:${mediaType}:${pathSegments.join(':')}`;
+    const cacheKey = `simkl-discover:v2:${mediaType}:${pathSegments.join(':')}`;
     const response: any = await cacheWrapGlobal(
       cacheKey,
       async () => {
@@ -1395,7 +1394,7 @@ async function fetchSimklGenreItems(
     return { items, hasMore, totalItems, totalPages };
   } catch (err: any) {
     logger.error(`Error fetching Simkl discover ${mediaType} items:`, err.message);
-    return { items: [], hasMore: false };
+    throw err;
   }
 }
 

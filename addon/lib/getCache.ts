@@ -21,6 +21,7 @@ const {
   normalizeMetaReleaseAvailability,
   normalizeReleaseAvailabilityInPayload,
 }: any = require('../utils/releaseAvailability');
+const { capRedisTtl }: any = require('./catalogTtl');
 
 function hashConfig(configObj: any): string {
   const str = typeof configObj === 'string' ? configObj : stableStringify(configObj);
@@ -1441,7 +1442,9 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
   }
 
   let key: string;
-  if (isAuthCatalog) {
+  if (options.canonicalSourceSignature) {
+    key = `catalog:canonical-v6:${options.canonicalSourceSignature}:${catalogKey}`;
+  } else if (isAuthCatalog) {
     const sessionId = config.sessionId || '';
     key = `catalog:${sessionId}:${configHash}:${catalogKey}`;
   } else if (isAiringTodayCatalog) {
@@ -1481,8 +1484,8 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
     ...options,
     refreshAhead: !isAiringTodayCatalog,
     onHit: (hit: any) => {
-      if (cacheTTL > 0 && typeof redis?.expire === 'function' && hit?.versionedKey) {
-        void Promise.resolve(redis.expire(hit.versionedKey, cacheTTL)).catch(() => {});
+      if (cacheTTL > 0 && hit?.versionedKey) {
+        void capRedisTtl(redis, hit.versionedKey, cacheTTL).catch(() => {});
       }
       if (typeof existingOnHit === 'function') {
         existingOnHit(hit);

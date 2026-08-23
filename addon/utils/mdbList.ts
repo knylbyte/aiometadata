@@ -1410,7 +1410,7 @@ async function fetchMDBListUpNext(
 ): Promise<{ items: any[], hasMore: boolean, limit: number }> {
   if (!apiKey) {
     logger.warn('[MDBList Up Next] Missing API key');
-    return { items: [], hasMore: false, limit };
+    throw Object.assign(new Error('MDBList authentication required'), { status: 401 });
   }
 
   try {
@@ -1445,7 +1445,7 @@ async function fetchMDBListUpNext(
     };
   } catch (error: any) {
     logger.error(`[MDBList Up Next] Error fetching up next shows: ${error.message}`);
-    return { items: [], hasMore: false, limit };
+    throw error;
   }
 }
 

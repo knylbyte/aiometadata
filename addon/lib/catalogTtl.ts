@@ -5,6 +5,19 @@ export interface CatalogTtlPolicy {
   terminalTtl: number;
 }
 
+export async function capRedisTtl(
+  redisClient: { ttl?: (key: string) => Promise<number>; expire?: (key: string, seconds: number) => Promise<unknown> } | null | undefined,
+  key: string,
+  maximumTtl: number
+): Promise<void> {
+  if (!redisClient || !key || !Number.isFinite(maximumTtl) || maximumTtl <= 0
+    || typeof redisClient.ttl !== 'function' || typeof redisClient.expire !== 'function') return;
+  const cap = Math.max(1, Math.floor(maximumTtl));
+  const remaining = await redisClient.ttl(key);
+  if (remaining === -2) return;
+  if (remaining === -1 || remaining > cap) await redisClient.expire(key, cap);
+}
+
 function nonNegativeInteger(value: unknown, fallback: number): number {
   const parsed = typeof value === 'number' ? value : Number.parseInt(String(value ?? ''), 10);
   return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;

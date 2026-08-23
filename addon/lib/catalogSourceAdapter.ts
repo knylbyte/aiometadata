@@ -15,10 +15,22 @@ export interface ProviderPageResult {
   metas: any[];
   rawCount: number;
   entries?: ReconstructedCatalogEntry[];
-  resumeAfterBatch?: ProviderResumeState;
-  exhaustion?: CatalogExhaustion;
+  resumeAfterBatch: ProviderResumeState;
+  exhaustion: CatalogExhaustion;
   total?: number;
   hasMore?: boolean;
+}
+
+export function attachProviderPageMetadata(metas: any[], info: Record<string, any>): any[] {
+  if (!Array.isArray(metas) || !Number.isInteger(info.rawCount) || info.rawCount < 0) {
+    throw new Error('Provider page metadata requires metas and a non-negative rawCount');
+  }
+  Object.defineProperty(metas, '_providerPageInfo', {
+    value: { ...info },
+    enumerable: false,
+    configurable: true,
+  });
+  return metas;
 }
 
 export interface AdapterContext {
@@ -153,16 +165,11 @@ export function createFixedPageAdapter(input: {
     if (!Number.isInteger(output.rawCount) || output.rawCount < 0 || output.metas.length > output.rawCount) {
       throw new Error(`${input.providerId} returned an invalid rawCount`);
     }
-    const exhaustion = resolveFixedPageExhaustion({
-      rawCount: output.rawCount,
-      nativePageSize: input.nativePageSize,
-      page,
-      exhaustion: output.exhaustion,
-      hasMore: output.hasMore,
-      total: output.total,
-      emptyPageConfirmsEnd: input.emptyPageConfirmsEnd,
-      shortPageConfirmsEnd: input.shortPageConfirmsEnd,
-    });
+    if (!isProviderResumeState(output.resumeAfterBatch)
+      || !['confirmed', 'not-exhausted', 'unknown'].includes(output.exhaustion)) {
+      throw new Error(`${input.providerId} returned an incomplete provider page contract`);
+    }
+    const exhaustion = output.exhaustion;
     const pageSpan = exhaustion === 'confirmed' && output.rawCount > 0 ? output.rawCount : input.nativePageSize;
     const entries = output.entries || output.metas.map((meta, index) => ({
       meta,
@@ -171,9 +178,52 @@ export function createFixedPageAdapter(input: {
         ? { kind: 'page-index' as const, page: page + 1, index: 0 }
         : { kind: 'page-index' as const, page, index: index + 1 },
     }));
-    const resumeAfterBatch = output.resumeAfterBatch || { kind: 'page-index' as const, page: page + 1, index: 0 };
-    if (!isProviderResumeState(resumeAfterBatch)) throw new Error(`${input.providerId} returned an invalid resume state`);
-    return { entries, rawCount: output.rawCount, resumeAfterBatch, exhaustion };
+    return { entries, rawCount: output.rawCount, resumeAfterBatch: output.resumeAfterBatch, exhaustion };
+  };
+}
+
+export function providerPageResultFromHandler(input: {
+  catalogId: string;
+  canonicalPageSize: number;
+  page: number;
+  nativePageSize: number;
+  metas: any[];
+}): ProviderPageResult {
+  const definition = getCatalogProviderDefinition(input);
+  const declaredSize = definition.capabilities.nativePageSize || definition.capabilities.maxLimit;
+  if (declaredSize !== input.nativePageSize) {
+    throw new Error(`${input.catalogId} fetched with ${input.nativePageSize}, but its adapter declares ${declaredSize}`);
+  }
+  const info = (input.metas as any)?._providerPageInfo;
+  if (!info || !Number.isInteger(info.rawCount) || info.rawCount < 0) {
+    throw new Error(`${input.catalogId} did not report rawCount from its provider response`);
+  }
+  const exhaustion = resolveFixedPageExhaustion({
+    rawCount: info.rawCount,
+    nativePageSize: input.nativePageSize,
+    page: input.page,
+    exhaustion: info.exhaustion,
+    hasMore: info.hasMore,
+    total: info.total,
+    emptyPageConfirmsEnd: definition.capabilities.emptyPageConfirmsEnd === true,
+    shortPageConfirmsEnd: definition.capabilities.shortPageConfirmsEnd === true,
+  });
+  const resumeAfterBatch = info.resumeAfterBatch || {
+    kind: 'page-index' as const,
+    page: input.page + 1,
+    index: 0,
+  };
+  if (!isProviderResumeState(resumeAfterBatch)) {
+    throw new Error(`${input.catalogId} did not report a valid provider resume state`);
+  }
+  return {
+    metas: input.metas,
+    rawCount: info.rawCount,
+    entries: info.entries,
+    resumeAfterBatch,
+    exhaustion,
+    hasMore: info.hasMore,
+    total: info.total,
   };
 }
 

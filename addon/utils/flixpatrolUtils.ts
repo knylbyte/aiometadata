@@ -203,7 +203,9 @@ export async function getFlixPatrolMetas(
   if (!chart || chart.entries.length === 0) {
     const label = variantId ? `${service}.${mediaType}.${variantId}` : `${service}.${mediaType}`;
     logger.warn(`No chart found for ${label} in ${countrySlug}`);
-    return [];
+    const empty: any[] = [];
+    Object.defineProperty(empty, '_rawCount', { value: 0, enumerable: false });
+    return empty;
   }
 
   logger.info(`Processing ${chart.entries.length} entries from ${chart.catalog_id} (${countrySlug})`);
@@ -241,6 +243,10 @@ export async function getFlixPatrolMetas(
   );
 
   const validMetas = metas.filter(Boolean);
+  Object.defineProperty(validMetas, '_rawCount', {
+    value: chart.entries.length,
+    enumerable: false,
+  });
   logger.debug(`Resolved ${validMetas.length}/${chart.entries.length} entries for ${chart.catalog_id}`);
   return validMetas;
 }

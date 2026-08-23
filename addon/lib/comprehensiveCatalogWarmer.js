@@ -9,8 +9,8 @@ const {
   writeMetaComponentsBatchWithConfig,
 } = require('./getCache');
 const { fixedCatalogPageSize } = require('./catalogPageSize');
-const { buildCanonicalCatalogCacheArgs, buildCatalogQuerySignature, hydrateCanonicalPageWindow, resolveCanonicalPageWindow, writeCanonicalPages } = require('./catalogFetchPlanner');
-const { createCatalogSourceAdapter, getCatalogProviderDefinition } = require('./catalogSourceAdapter');
+const { buildCanonicalCatalogCacheArgs, buildCatalogSourceQuerySignature, hydrateCanonicalPageWindow, resolveCanonicalPageWindow, writeCanonicalPages } = require('./catalogFetchPlanner');
+const { attachProviderPageMetadata, createCatalogSourceAdapter, getCatalogProviderDefinition, providerPageResultFromHandler } = require('./catalogSourceAdapter');
 const { resolveEffectiveCatalogTtl } = require('./catalogTtl');
 const { readCatalogTerminal, terminalKey, writeCatalogTerminal } = require('./catalogPagination');
 const { getGenreList } = require('./getGenreList');
@@ -875,7 +875,7 @@ class ComprehensiveCatalogWarmer {
             pagesThisPass * canonicalPageSize,
             canonicalPageSize
           );
-          const querySignature = buildCatalogQuerySignature({
+          const querySignature = buildCatalogSourceQuerySignature({
             catalogId,
             type: actualType,
             language: config.language,
@@ -884,24 +884,51 @@ class ComprehensiveCatalogWarmer {
             catalogConfig,
             configFingerprint: {
               sfw: config.sfw,
-              hideWatched: config.hideWatched,
-              filters: config.filters || null,
+              includeAdult: config.includeAdult,
+              timezone: config.timezone,
+              providers: config.providers || null,
+              accountScope: /^(trakt|anilist|simkl|movielens|publicmetadb|tmdb\.(watchlist|favorites))\./.test(catalogId)
+                ? uuid
+                : null,
             },
           });
           const catalogTerminalKey = terminalKey(uuid, querySignature);
           const keyForPage = (page) => {
             const pageArgs = buildCanonicalCatalogCacheArgs(extraArgs || {}, page, canonicalPageSize, querySignature);
             if (catalogId.startsWith('mdblist.') && usesMdblistExternalItemsEndpoint(catalogConfig)) {
-              pageArgs._mdblistPaging = 'typed-canonical-v5';
+              pageArgs._mdblistPaging = 'typed-canonical-v6';
             }
             return `${catalogId}:${actualType}:${stableStringify(pageArgs)}`;
+          };
+          const projectWarmResult = async (fullResult) => {
+            const providerPageInfo = fullResult?.metas?._providerPageInfo;
+            const projected = await this.persistFullMetasAndProjectCatalog(fullResult, { ...config, userUUID: uuid }, actualType, {
+              useShowPoster: !!extraArgs.useShowPoster,
+            });
+            if (providerPageInfo && Array.isArray(projected?.metas)) {
+              const byId = new Map(projected.metas.map(meta => [meta?.id, meta]));
+              Object.defineProperty(projected.metas, '_providerPageInfo', {
+                value: {
+                  ...providerPageInfo,
+                  ...(Array.isArray(providerPageInfo.entries) ? {
+                    entries: providerPageInfo.entries.map(entry => ({
+                      ...entry,
+                      meta: byId.get(entry.meta?.id) || entry.meta,
+                    })),
+                  } : {}),
+                },
+                enumerable: false,
+              });
+            }
+            return projected;
           };
           const fetchWarmPage = async (page) => {
           // Check if this is a MAL catalog
           if (catalogId.startsWith('mal.')) {
             const configWithUUID = { ...config, userUUID: uuid };
-            const fullResult = await this.warmMALCatalog(catalogId, page, configWithUUID, extraArgs);
-            return await this.persistFullMetasAndProjectCatalog(fullResult, configWithUUID, actualType);
+            const { getCatalog } = require('./getCatalog');
+            const fullResult = await getCatalog(catalog.type, config.language, page, catalogId, extraArgs.genre || null, configWithUUID, uuid, true);
+            return await projectWarmResult(fullResult);
           } else if (catalogId === 'tmdb.trending') {
             // Special handling for tmdb.trending - call getTrending directly
             if (!uuid) {
@@ -910,7 +937,7 @@ class ComprehensiveCatalogWarmer {
             const configWithUUID = { ...config, userUUID: uuid };
             const { getTrending } = require('./getTrending');
             const fullResult = await getTrending(catalog.type, config.language, page, extraArgs.genre || null, configWithUUID, uuid, true);
-            return await this.persistFullMetasAndProjectCatalog(fullResult, configWithUUID, actualType);
+            return await projectWarmResult(fullResult);
           } else if (catalogId === 'tvmaze.schedule') {
             const configWithUUID = { ...config, userUUID: uuid };
             const fullResult = await getTvmazeScheduleCatalog({
@@ -925,7 +952,12 @@ class ComprehensiveCatalogWarmer {
               enableErrorCaching: false,
               maxRetries: 1,
             });
-            return await this.persistFullMetasAndProjectCatalog(fullResult, configWithUUID, actualType);
+            attachProviderPageMetadata(fullResult.metas, {
+              rawCount: fullResult.rawCount,
+              hasMore: fullResult.hasMore,
+              total: fullResult.total,
+            });
+            return await projectWarmResult(fullResult);
           } else {
             // Everything else goes through getCatalog
             if (!uuid) {
@@ -944,10 +976,12 @@ class ComprehensiveCatalogWarmer {
               Object.defineProperty(projected.metas, '_providerPageInfo', {
                 value: {
                   ...providerPageInfo,
-                  entries: providerPageInfo.entries.map(entry => ({
-                    ...entry,
-                    meta: byId.get(entry.meta?.id) || entry.meta,
-                  })),
+                  ...(Array.isArray(providerPageInfo.entries) ? {
+                    entries: providerPageInfo.entries.map(entry => ({
+                      ...entry,
+                      meta: byId.get(entry.meta?.id) || entry.meta,
+                    })),
+                  } : {}),
                 },
                 enumerable: false,
               });
@@ -968,19 +1002,16 @@ class ComprehensiveCatalogWarmer {
               ? (config.apiKeys?.mdblist || process.env.MDBLIST_API_KEY || process.env.BUILT_IN_MDBLIST_API_KEY || '')
               : undefined,
             providerBatchTtl: resolveEffectiveCatalogTtl({ catalogConfig }).providerBatchTtl,
-            fetchPage: async page => {
+            fetchPage: async (page, nativePageSize) => {
               const result = await fetchWarmPage(page);
               const metas = result?.metas || [];
-              const info = metas?._providerPageInfo || result?._providerPageInfo || {};
-              return {
+              return providerPageResultFromHandler({
+                catalogId,
+                canonicalPageSize,
+                page,
+                nativePageSize,
                 metas,
-                rawCount: Number.isInteger(info.rawCount) ? info.rawCount : metas.length,
-                entries: info.entries,
-                resumeAfterBatch: info.resumeAfterBatch,
-                exhaustion: info.exhaustion,
-                hasMore: info.hasMore,
-                total: info.total,
-              };
+              });
             },
             fetchOffsetBatch: async (resumeState, requestedRawCount) => {
               if (resumeState.kind !== 'offset') throw new Error(`Offset adapter received ${resumeState.kind} resume state`);
@@ -1017,6 +1048,7 @@ class ComprehensiveCatalogWarmer {
             readPage: page => readCatalogCache(uuid, keyForPage(page), {
               config,
               effectiveCatalogTtl: catalogTtlPolicy.canonicalPageTtl,
+              canonicalSourceSignature: querySignature,
               onHit: () => {
                 this.stats.pagesFromCache++;
                 if (this.stats.uuidStats[uuid]) this.stats.uuidStats[uuid].pagesFromCache++;
@@ -1027,6 +1059,7 @@ class ComprehensiveCatalogWarmer {
               maxRetries: 1,
               config,
               effectiveCatalogTtl: catalogTtlPolicy.canonicalPageTtl,
+              canonicalSourceSignature: querySignature,
             }),
             writePages: pages => writeCanonicalPages(pages, (page, value) =>
               cacheWrapCatalog(uuid, keyForPage(page), async () => value, {
@@ -1034,6 +1067,7 @@ class ComprehensiveCatalogWarmer {
                 maxRetries: 1,
                 config,
                 effectiveCatalogTtl: catalogTtlPolicy.canonicalPageTtl,
+                canonicalSourceSignature: querySignature,
               })
             ),
             readTerminal: () => readCatalogTerminal(catalogTerminalKey, catalogTtlPolicy.terminalTtl),
