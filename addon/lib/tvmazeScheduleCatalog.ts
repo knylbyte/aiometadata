@@ -30,6 +30,7 @@ interface TvmazeScheduleCatalogOptions {
 
 interface TvmazeScheduleCatalogResult {
   metas: MetaData[];
+  rawItems: TvmazeScheduleEntry[];
   rawCount: number;
   hasMore: boolean;
   total: number;
@@ -50,7 +51,7 @@ async function getTvmazeScheduleCatalog({
   const scheduleEntries = await tvmaze.getFullSchedule(date, country) as TvmazeScheduleEntry[];
 
   if (!Array.isArray(scheduleEntries) || scheduleEntries.length === 0) {
-    return { metas: [], rawCount: 0, hasMore: false, total: 0 };
+    return { metas: [], rawItems: [], rawCount: 0, hasMore: false, total: 0 };
   }
 
   const filteredEntries = scheduleEntries.filter((entry) => {
@@ -110,6 +111,7 @@ async function getTvmazeScheduleCatalog({
 
   return {
     metas: metasFromSchedule.filter((meta): meta is MetaData => Boolean(meta)),
+    rawItems: pageEntries,
     rawCount: pageEntries.length,
     hasMore: endIndex < dedupedEntries.length,
     total: dedupedEntries.length,

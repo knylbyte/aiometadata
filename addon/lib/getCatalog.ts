@@ -36,6 +36,11 @@ import { cacheWrapMetaSmart } from './getCache.js';
 import { UserConfig } from '../types/index.js';
 import { catalogRequestPageSize } from './catalogPageSize.js';
 import { getCatalogProviderDefinition } from './catalogSourceAdapter.js';
+import {
+  buildCatalogScopeFingerprint,
+  EXTERNAL_ADDON_BATCH_CACHE_VERSION,
+  resolveCatalogCacheScope,
+} from './catalogCacheIdentity.js';
 
 const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p/w500';
 const TVDB_IMAGE_BASE = 'https://artworks.thetvdb.com';
@@ -397,6 +402,7 @@ async function getMalDiscoverCatalog(
     logger.success(`[MAL Discover] Processed ${metas.length} items for ${catalogId} (page ${page})`);
     return attachProviderPageInfo(metas, {
       rawCount: response.items.length,
+      rawItems: response.items,
       hasMore: response.hasMore,
       total: response.total,
     });
@@ -533,7 +539,7 @@ async function getMalCatalog(
   }
 
   const metas = await Utils.parseAnimeCatalogMetaBatch(animeResults, config, language);
-  return attachProviderPageInfo(metas, { rawCount: animeResults.length });
+  return attachProviderPageInfo(metas, { rawCount: animeResults.length, rawItems: animeResults });
 }
 
 async function getTvmazeScheduleHandler(
@@ -563,6 +569,7 @@ async function getTvmazeScheduleHandler(
   });
   return attachProviderPageInfo(result.metas, {
     rawCount: result.rawCount,
+    rawItems: result.rawItems,
     hasMore: result.hasMore,
     total: result.total,
   });
@@ -785,6 +792,7 @@ async function getTvdbCatalog(type: string, catalogId: string, genreName: string
   
   return attachProviderPageInfo(validMetas, {
     rawCount: paginatedResults.length,
+    rawItems: paginatedResults,
     hasMore: endIndex < sortedResults.length,
     total: sortedResults.length,
   });
@@ -824,7 +832,7 @@ async function getTvdbCollectionsCatalog(type: string, id: string, page: number,
         year: extended.year || null
       };
     }));
-    return attachProviderPageInfo(metas.filter(Boolean), { rawCount: collections.length });
+    return attachProviderPageInfo(metas.filter(Boolean), { rawCount: collections.length, rawItems: collections });
   }
   throw Object.assign(new Error(`Unsupported TVDB collections catalog: ${id}`), { status: 400 });
 }
@@ -879,6 +887,7 @@ async function getTvdbListCatalog(type: string, id: string, page: number, langua
   logger.success(`[TVDB List] Processed ${validMetas.length} items for ${id} (page ${listPage})`);
   return attachProviderPageInfo(validMetas, {
     rawCount: pageEntities.length,
+    rawItems: pageEntities,
     hasMore: startIndex + pageEntities.length < selected.length,
     total: selected.length,
   });
@@ -971,6 +980,7 @@ async function getTvdbDiscoverCatalog(
     logger.success(`[TVDB Discover] Processed ${validMetas.length} items for ${id}`);
     return attachProviderPageInfo(validMetas, {
       rawCount: paginatedResults.length,
+      rawItems: paginatedResults,
       hasMore: endIndex < response.length,
       total: response.length,
     });
@@ -1020,6 +1030,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       let metas = await parseMDBListItems(normalizedItems, type, language, config, includeVideos);
       return attachProviderPageInfo(metas, {
         rawCount: response.items.length,
+        rawItems: response.items,
         hasMore: response.hasMore,
       });
     }
@@ -1073,6 +1084,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       logger.success(`[MDBList Up Next] Processed ${metas.length} items`);
       return attachProviderPageInfo(metas, {
         rawCount: response.items.length,
+        rawItems: response.items,
         hasMore: response.hasMore,
       });
     }
@@ -1327,6 +1339,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
         if (results.length === 0) {
           return attachProviderPageInfo([], {
             rawCount: response.results.length,
+            rawItems: response.results,
             hasMore: discoverPage < (response.total_pages || 1),
             total: response.total_results,
           });
@@ -1356,6 +1369,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       logger.success(`[TMDB Discover] Processed ${validMetas.length} items for ${id}`);
       return attachProviderPageInfo(validMetas, {
         rawCount: response.results.length,
+        rawItems: response.results,
         hasMore: discoverPage < (response.total_pages || 1),
         total: response.total_results,
       });
@@ -1435,6 +1449,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       logger.success(`[TMDB Collection] Processed ${validMetas.length} items for ${id} (page ${pageNum})`);
       return attachProviderPageInfo(validMetas, {
         rawCount: pageParts.length,
+        rawItems: pageParts,
         hasMore: pageNum * pageSize < parts.length,
         total: parts.length,
       });
@@ -1552,6 +1567,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
       logger.success(`[TMDB List] Processed ${validMetas.length} items for list ${listId}`);
       return attachProviderPageInfo(validMetas, {
         rawCount: result.items.length,
+        rawItems: result.items,
         hasMore: pageNum < (result.total_pages || 1),
         total: result.total_results,
       });
@@ -1618,6 +1634,7 @@ async function getTmdbAndMdbListCatalog(type: string, id: string, genre: string,
   
   return attachProviderPageInfo(validMetas, {
     rawCount: res.results.length,
+    rawItems: res.results,
     hasMore: Number(res.page || page) < Number(res.total_pages || 1),
     total: res.total_results,
   });
@@ -2058,8 +2075,6 @@ function findProvider(providerId: string): any {
   return provider;
 }
 
-const EXTERNAL_SEEN_ID_MEMORY = 500;
-
 async function getExternalAddonCatalog(type: string, catalogId: string, genre: string, page: number, language: string, config: UserConfig, userUUID: string, includeVideos: boolean = false, skip?: number): Promise<any[]> {
   try {
     const userCatalog = config.catalogs?.find(c => c.id === catalogId && c.type === type);
@@ -2068,48 +2083,32 @@ async function getExternalAddonCatalog(type: string, catalogId: string, genre: s
     }
 
     const catalogUrl = userCatalog.sourceUrl || userCatalog.source;
-    const catalogTTL = userCatalog.cacheTTL ?? parseInt(process.env.CATALOG_TTL || String(24 * 60 * 60), 10);
+    const catalogTTL = Math.max(0, Number(userCatalog.cacheTTL ?? parseInt(process.env.CATALOG_TTL || String(24 * 60 * 60), 10)) || 0);
     const batchSize = catalogRequestPageSize();
-    const useCursor = false;
     const stremioSkip = skip ?? (page - 1) * batchSize;
-
-    const cursorKey = useCursor ? `catalog-cursor:${userUUID}:${catalogId}:${type}:${genre || 'all'}` : null;
-    let upstreamSkip: number;
+    const upstreamSkip = stremioSkip;
     const seenIds = new Set<string>();
-
-    if (!useCursor) {
-      upstreamSkip = stremioSkip;
-    } else if (stremioSkip === 0) {
-      upstreamSkip = 0;
-      await redis!.del(cursorKey!);
-    } else {
-      const raw = await redis!.get(cursorKey!);
-      if (raw) {
-        const cursor = JSON.parse(raw);
-        if (cursor.served === stremioSkip) {
-          upstreamSkip = cursor.upstreamOffset;
-          for (const id of cursor.seenIds || []) seenIds.add(id);
-        } else {
-          logger.debug(`[External Addon] ${catalogId}: cursor mismatch (served=${cursor.served}, skip=${stremioSkip}) - falling back to skip offset`);
-          upstreamSkip = stremioSkip;
-          await redis!.del(cursorKey!);
-        }
-      } else {
-        logger.debug(`[External Addon] ${catalogId}: no cursor for skip=${stremioSkip} - falling back to skip offset`);
-        upstreamSkip = stremioSkip;
-      }
-    }
+    const scope = resolveCatalogCacheScope({
+      cleanId: catalogId,
+      catalogConfig: userCatalog,
+      config,
+      userUUID,
+      provider: catalogId.startsWith('stremthru.') ? 'stremthru' : 'custom',
+      sourceUrl: catalogUrl,
+    });
+    const scopeFingerprint = buildCatalogScopeFingerprint(scope);
 
     logger.info(`[External Addon] ${catalogId}: type=${type}, stremioSkip=${stremioSkip}, upstreamSkip=${upstreamSkip}, genre=${genre || 'none'}`);
 
     const readBatch = async (offset: number) => {
-      const cacheKey = `custom-batch:v2:${catalogId}:${genre || 'all'}:skip=${offset}`;
-      return await cacheWrap(cacheKey, async () => {
-        return await fetchStremThruCatalog(catalogUrl, offset, genre);
-      }, catalogTTL, { enableErrorCaching: true, maxRetries: 2 });
+      const loader = () => fetchStremThruCatalog(catalogUrl, offset, genre);
+      if (catalogTTL === 0) return loader();
+      const cacheKey = `${EXTERNAL_ADDON_BATCH_CACHE_VERSION}:${scopeFingerprint}:${catalogId}:${genre || 'all'}:skip=${offset}`;
+      return await cacheWrap(cacheKey, loader, catalogTTL, { enableErrorCaching: false, maxRetries: 0 });
     };
 
     const collected: any[] = [];
+    const consumedRawItems: any[] = [];
     let offset = upstreamSkip;
     let batchesRead = 0;
 
@@ -2124,6 +2123,7 @@ async function getExternalAddonCatalog(type: string, catalogId: string, genre: s
         upstreamExhausted = true;
         break;
       }
+      consumedRawItems.push(...items);
 
       for (let i = 0; i < items.length; i += batchSize) {
         const chunk = items.slice(i, i + batchSize);
@@ -2138,20 +2138,10 @@ async function getExternalAddonCatalog(type: string, catalogId: string, genre: s
       offset += items.length;
     }
 
-    if (cursorKey && offset > upstreamSkip) {
-      const newServed = stremioSkip + collected.length;
-      const recentIds = [...seenIds].slice(-EXTERNAL_SEEN_ID_MEMORY);
-      await redis!.set(
-        cursorKey,
-        JSON.stringify({ served: newServed, upstreamOffset: offset, seenIds: recentIds }),
-        'EX',
-        catalogTTL
-      );
-    }
-
     logger.success(`[External Addon] ${catalogId}: ${collected.length} items from ${batchesRead} batch(es) (stremioSkip=${stremioSkip}, nextUpstream=${offset})`);
     return attachProviderPageInfo(collected, {
       rawCount: offset - upstreamSkip,
+      rawItems: consumedRawItems,
       exhaustion: upstreamExhausted ? 'confirmed' : 'unknown',
     });
 
@@ -2538,6 +2528,7 @@ async function getTraktCatalog(
     logger.success(`[Trakt] Processed ${metas.length} items for catalog ${catalogId} (page ${page})`);
     return attachProviderPageInfo(metas, {
       rawCount: response.items.length,
+      rawItems: response.items,
       hasMore: response.hasMore,
       total: response.totalItems,
     });
@@ -2591,6 +2582,7 @@ async function resolveAniListPageWithProvenance(
     value: {
       entries,
       rawCount: items.length,
+      rawItems: items,
       resumeAfterBatch: { kind: 'page-index', page: page + 1, index: 0 },
       exhaustion: hasMore === true ? 'not-exhausted' : hasMore === false ? 'confirmed' : 'unknown',
     },
@@ -2872,6 +2864,7 @@ async function getMalUserListCatalog(
     logger.success(`[MAL] Processed ${validMetas.length} items for catalog ${catalogId} (page ${page})`);
     return attachProviderPageInfo(validMetas, {
       rawCount: response.items.length,
+      rawItems: response.items,
       hasMore: response.hasMore,
     });
   } catch (err: any) {
@@ -2955,6 +2948,7 @@ async function getLetterboxdCatalog(
     logger.debug(`Successfully processed ${metas.length} Letterboxd items`);
     return attachProviderPageInfo(metas, {
       rawCount: pageItems.length,
+      rawItems: pageItems,
       hasMore: endIndex < filteredItems.length,
       total: filteredItems.length,
     });
@@ -3110,7 +3104,7 @@ async function getMovieLensCatalog(
     const credId = config.apiKeys?.movieLensCredId;
     if (!credId) {
       logger.warn(`[MovieLens] Catalog ${catalogId} requested but no MovieLens account is connected`);
-      return [];
+      throw Object.assign(new Error('MovieLens account connection required'), { status: 401 });
     }
 
     const catalogConfig = config.catalogs?.find(c => c.id === catalogId);
@@ -3195,7 +3189,7 @@ async function getMovieLensCatalog(
 
     const metas = await parseMDBListItems(mdblistShaped, 'movie', language, config, includeVideos);
     logger.info(`[MovieLens] ${catalogId} page ${page} (genre: ${genreName || 'all'}): ${metas.length} metas`);
-    return attachProviderPageInfo(metas, { rawCount: windowItems.length });
+    return attachProviderPageInfo(metas, { rawCount: windowItems.length, rawItems: windowItems });
   } catch (error: any) {
     logger.error(`[MovieLens] Catalog ${catalogId} failed: ${error.message}`);
     throw error;
@@ -3262,6 +3256,7 @@ async function getSimklCatalog(
       logger.success(`[Simkl Up Next] Processed ${metas.length} items (page ${page}) in ${Date.now() - upNextStart}ms`);
       return attachProviderPageInfo(metas, {
         rawCount: pageItems.length,
+        rawItems: pageItems,
         hasMore: startIndex + pageItems.length < allItems.length,
         total: allItems.length,
       });
@@ -3514,6 +3509,7 @@ async function getSimklCatalog(
     logger.success(`[Simkl] Processed ${metas.length} items for catalog ${catalogId} (page ${page})`);
     return attachProviderPageInfo(metas, {
       rawCount: response.items.length,
+      rawItems: response.items,
       hasMore: response.hasMore,
       total: response.totalItems,
     });
@@ -3560,7 +3556,11 @@ async function getFlixPatrolCatalog(
     logger.success(`[FlixPatrol] Processed ${metas.length} items for catalog ${catalogId}`);
     const rawCount = (metas as any)._rawCount;
     if (!Number.isInteger(rawCount)) throw new Error('FlixPatrol did not report its raw chart size');
-    return attachProviderPageInfo(metas, { rawCount, hasMore: undefined });
+    return attachProviderPageInfo(metas, {
+      rawCount,
+      rawItems: (metas as any)._rawItems,
+      hasMore: undefined,
+    });
 
   } catch (err: any) {
     const errorLine = err.stack?.split('\n')[1]?.trim() || 'unknown';
@@ -3593,7 +3593,7 @@ async function getPublicMetaDBCatalog(
       const items = await fetchResume(apiKey);
       let metas = await parseResumeItems(items, type, language, config, useShowPoster);
       logger.success(`[PublicMetaDB] Up Next: ${metas.length} items`);
-      return attachProviderPageInfo(metas, { rawCount: items.length, hasMore: false });
+      return attachProviderPageInfo(metas, { rawCount: items.length, rawItems: items, hasMore: false });
     }
 
     if (catalogId.startsWith('publicmetadb.list.')) {
@@ -3604,6 +3604,7 @@ async function getPublicMetaDBCatalog(
       logger.success(`[PublicMetaDB] List ${listId}: ${metas.length} items (page ${page})`);
       return attachProviderPageInfo(metas, {
         rawCount: (data.items || []).length,
+        rawItems: data.items || [],
         hasMore: data.hasMore ?? data.pagination?.hasMore,
         total: data.totalItems ?? data.pagination?.totalItems,
       });
@@ -3617,6 +3618,7 @@ async function getPublicMetaDBCatalog(
       logger.success(`[PublicMetaDB] Pick ${pickId}: ${metas.length} items (page ${page})`);
       return attachProviderPageInfo(metas, {
         rawCount: (data.items || []).length,
+        rawItems: data.items || [],
         hasMore: data.hasMore ?? data.pagination?.hasMore,
       });
     }
@@ -3717,44 +3719,15 @@ async function getMergedCatalog(
     throw Object.assign(new Error(`[Merged] No valid sources remain for ${catalogId}`), { status: 400 });
   }
 
-  const { applyCatalogFilters } = require('../utils/catalogFilters.js');
   const pageSize = catalogRequestPageSize();
   const stremioSkip = skip ?? (page - 1) * pageSize;
+  const targetCount = stremioSkip + pageSize + 1;
   const hasGenreFilter = !!(genre && genre !== 'None' && normalizeGenreKey(genre));
-  const catalogTTL = parseInt(process.env.CATALOG_TTL || String(24 * 60 * 60), 10);
-
-  const cursorKey = redis ? `merged-cursor:${userUUID}:${catalogId}:${genre || 'all'}` : null;
-
-  interface MergedCursor {
-    served: number;
-    perSource: { catalogId: string; catalogType: string; nextPage: number }[];
-    seenIds: string[];
-    activeSourceIdx?: number;
-  }
-
-  let cursor: MergedCursor | null = null;
-  let perSourcePage: Map<string, number>;
+  const perSourcePage = new Map<string, number>(
+    validSources.map((source: any) => [`${source.catalogId}:${source.catalogType}`, 1])
+  );
   let activeSourceIdx = 0;
-
-  if (stremioSkip === 0) {
-    if (cursorKey) await redis!.del(cursorKey);
-    perSourcePage = new Map(validSources.map((s: any) => [`${s.catalogId}:${s.catalogType}`, 1]));
-  } else if (cursorKey) {
-    const raw = await redis!.get(cursorKey);
-    if (raw) {
-      cursor = JSON.parse(raw);
-      perSourcePage = new Map(
-        cursor!.perSource.map((s) => [`${s.catalogId}:${s.catalogType}`, s.nextPage])
-      );
-      activeSourceIdx = cursor!.activeSourceIdx ?? 0;
-    } else {
-      perSourcePage = new Map(validSources.map((s: any) => [`${s.catalogId}:${s.catalogType}`, 1]));
-    }
-  } else {
-    perSourcePage = new Map(validSources.map((s: any) => [`${s.catalogId}:${s.catalogType}`, 1]));
-  }
-
-  const seenIds = new Set<string>(cursor?.seenIds || []);
+  const seenIds = new Set<string>();
 
   const resolveDefaultGenre = async (srcId: string, srcType: string): Promise<string | null> => {
     const srcCfg = (config.catalogs as any[])?.find((c: any) => c.id === srcId && c.type === srcType);
@@ -3796,14 +3769,9 @@ async function getMergedCatalog(
   const fetchSourcePage = async (src: any, srcPage: number): Promise<{ items: any[]; rawLength: number }> => {
     try {
       const effectiveGenre = genre || await resolveDefaultGenre(src.catalogId, src.catalogType) || '';
-      const cacheArgs = buildCatalogCacheArgs(src.catalogId, src.catalogType, srcPage, effectiveGenre, config);
-      const catalogKey = `${src.catalogId}:${src.catalogType}:${stableStringify(cacheArgs)}`;
-
-      const result = await cacheWrapCatalog(userUUID, catalogKey, async () => {
-        return await getCatalog(
-          src.catalogType, language, srcPage, src.catalogId, effectiveGenre, config, userUUID, includeVideos
-        );
-      }, { config });
+      const result = await getCatalog(
+        src.catalogType, language, srcPage, src.catalogId, effectiveGenre, config, userUUID, includeVideos
+      );
 
       const raw = result?.metas || [];
       let items = raw;
@@ -3817,8 +3785,6 @@ async function getMergedCatalog(
         }
       }
 
-      items = await applyCatalogFilters(items, { type, config, catalogConfig, cleanId: catalogId });
-
       return { items, rawLength: raw.length };
     } catch (err: any) {
       logger.warn(`[Merged] Source ${src.catalogId} failed: ${err.message}`);
@@ -3830,7 +3796,7 @@ async function getMergedCatalog(
     let added = 0;
     let consumed = 0;
     for (const meta of metas) {
-      if (collected.length >= pageSize) break;
+      if (collected.length >= targetCount) break;
       consumed++;
       const key = mergedDedupKey(meta);
       if (key && seenIds.has(key)) continue;
@@ -3848,7 +3814,7 @@ async function getMergedCatalog(
     let added = 0;
     const consumedPerSource = new Array(validSources.length).fill(0);
     for (const { meta, srcIdx } of tagged) {
-      if (collected.length >= pageSize) break;
+      if (collected.length >= targetCount) break;
       const key = mergedDedupKey(meta);
       if (key && seenIds.has(key)) { consumedPerSource[srcIdx]++; continue; }
       if (key) seenIds.add(key);
@@ -3871,12 +3837,11 @@ async function getMergedCatalog(
   };
 
   const collected: any[] = [];
-  let totalRawConsumed = 0;
-  const maxAttempts = 15;
+  const maxAttempts = Math.max(15, Math.ceil(targetCount / pageSize) * validSources.length * 3);
   let attempts = 0;
 
   if (mergeMode === 'sequential') {
-    while (collected.length < pageSize && activeSourceIdx < validSources.length && attempts < maxAttempts) {
+    while (collected.length < targetCount && activeSourceIdx < validSources.length && attempts < maxAttempts) {
       attempts++;
       const src = validSources[activeSourceIdx];
       const key = `${src.catalogId}:${src.catalogType}`;
@@ -3889,7 +3854,6 @@ async function getMergedCatalog(
       }
 
       const { items, rawLength } = await fetchSourcePage(src, srcPage);
-      totalRawConsumed += rawLength;
       const { added, consumed } = collectDeduped(items, collected);
       if (consumed >= items.length) {
         if (rawLength === 0 || (items.length > 0 && added === 0)) {
@@ -3909,7 +3873,7 @@ async function getMergedCatalog(
     let exhaustedCount = validSources.length - liveCount;
     let consecutiveSkips = 0;
 
-    while (collected.length < pageSize && exhaustedCount < validSources.length && attempts < maxAttempts) {
+    while (collected.length < targetCount && exhaustedCount < validSources.length && attempts < maxAttempts) {
       attempts++;
       const srcIdx = activeSourceIdx % validSources.length;
       const src = validSources[srcIdx];
@@ -3926,7 +3890,6 @@ async function getMergedCatalog(
       consecutiveSkips = 0;
 
       const { items, rawLength } = await fetchSourcePage(src, srcPage);
-      totalRawConsumed += rawLength;
       const { added, consumed } = collectDeduped(items, collected);
       if (consumed >= items.length) {
         if (rawLength === 0 || (items.length > 0 && added === 0)) {
@@ -3942,7 +3905,7 @@ async function getMergedCatalog(
   } else {
     let exhaustedCount = [...perSourcePage.values()].filter(p => p <= 0).length;
 
-    while (collected.length < pageSize && exhaustedCount < validSources.length && attempts < maxAttempts) {
+    while (collected.length < targetCount && exhaustedCount < validSources.length && attempts < maxAttempts) {
       attempts++;
 
       const results = await Promise.all(
@@ -3953,7 +3916,6 @@ async function getMergedCatalog(
           return fetchSourcePage(src, srcPage);
         })
       );
-      totalRawConsumed += results.reduce((sum, result) => sum + result.rawLength, 0);
 
       const tagged = roundRobinInterleaveTagged(results.map(r => r.items));
       const { added, consumedPerSource } = collectDedupedTagged(
@@ -3984,28 +3946,20 @@ async function getMergedCatalog(
     }
   }
 
-  if (cursorKey) {
-    const newCursor: MergedCursor = {
-      served: stremioSkip + collected.length,
-      perSource: validSources.map((s: any) => ({
-        catalogId: s.catalogId,
-        catalogType: s.catalogType,
-        nextPage: perSourcePage.get(`${s.catalogId}:${s.catalogType}`) || -1,
-      })),
-      seenIds: [...seenIds],
-      activeSourceIdx,
-    };
-    await redis!.set(cursorKey, JSON.stringify(newCursor), 'EX', catalogTTL);
-  }
+  const pageItems = collected.slice(stremioSkip, stremioSkip + pageSize);
+  const sourcesExhausted = [...perSourcePage.values()].every(value => value <= 0);
+  const hasMore = collected.length > stremioSkip + pageSize || !sourcesExhausted;
 
   logger.success(
-    `[Merged] ${catalogId}: ${collected.length} items from ${validSources.length} sources ` +
+    `[Merged] ${catalogId}: ${pageItems.length} items from ${validSources.length} sources ` +
     `(skip=${stremioSkip}, seen=${seenIds.size}, mode=${mergeMode}` +
     `${hasGenreFilter ? `, genre="${genre}"` : ''})`
   );
-  return attachProviderPageInfo(collected, {
-    rawCount: totalRawConsumed,
-    exhaustion: [...perSourcePage.values()].every(value => value <= 0) ? 'confirmed' : 'unknown',
+  return attachProviderPageInfo(pageItems, {
+    rawCount: pageItems.length,
+    rawItems: pageItems,
+    hasMore,
+    exhaustion: sourcesExhausted && !hasMore ? 'confirmed' : 'unknown',
   });
 }
 

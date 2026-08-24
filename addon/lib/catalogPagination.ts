@@ -1,6 +1,7 @@
 import redis from './redisClient';
 import type { CanonicalCatalogPage, CanonicalTerminalState, ProviderResumeState } from './catalogFetchPlanner';
 import { capRedisTtl } from './catalogTtl';
+import { buildCatalogCursorKey, buildCatalogTerminalKey } from './catalogCacheIdentity';
 
 export interface CatalogCursor {
   served: number;
@@ -16,25 +17,26 @@ export interface CatalogCursor {
   sourceResume?: ProviderResumeState;
 }
 
-const CURSOR_PREFIX = 'catalog-cursor:v6';
-const TERMINAL_PREFIX = 'canonical-terminal:v6';
-
-function segment(value: unknown): string {
-  return encodeURIComponent(String(value ?? ''));
-}
-
 export function cursorKey(
   userUUID: string,
   catalogId: string,
   type: string,
   querySignature?: string,
-  served: number = 0
+  served: number = 0,
+  scopeFingerprint: string = 'scope-legacy'
 ): string {
-  return `${CURSOR_PREFIX}:${segment(userUUID)}:${segment(catalogId)}:${segment(type)}:${segment(querySignature || 'default')}:served:${Math.max(0, served | 0)}`;
+  return buildCatalogCursorKey({
+    scopeFingerprint,
+    userUUID,
+    catalogId,
+    type,
+    deliverySignature: querySignature,
+    served,
+  });
 }
 
-export function terminalKey(userUUID: string, querySignature: string): string {
-  return `${TERMINAL_PREFIX}:${segment(userUUID)}:${segment(querySignature)}`;
+export function terminalKey(scopeFingerprint: string, querySignature: string): string {
+  return buildCatalogTerminalKey({ scopeFingerprint, sourceQuerySignature: querySignature });
 }
 
 export async function readCursor(key: string): Promise<CatalogCursor | null> {

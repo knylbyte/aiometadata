@@ -4,8 +4,9 @@ import type { ProviderBatchResult, ProviderResumeState } from './catalogFetchPla
 import { isProviderResumeState, stableCatalogStringify } from './catalogFetchPlanner';
 import redis from './redisClient';
 import { capRedisTtl } from './catalogTtl';
+import { buildProviderBatchKey, PROVIDER_BATCH_CACHE_VERSION } from './catalogCacheIdentity';
 
-export const PROVIDER_BATCH_CACHE_VERSION = 'provider-batch:v3';
+export { PROVIDER_BATCH_CACHE_VERSION } from './catalogCacheIdentity';
 
 interface MemoryEntry {
   expiresAt: number;
@@ -33,8 +34,16 @@ export function providerBatchCacheKey(input: {
   querySignature: string;
   resumeState: ProviderResumeState;
   requestedUpstreamLimit: number;
+  scopeFingerprint?: string;
 }): string {
-  return `${PROVIDER_BATCH_CACHE_VERSION}:${input.provider}:${hash(input.sourceIdentity)}:${input.querySignature}:${hash(input.resumeState)}:${input.requestedUpstreamLimit}`;
+  return buildProviderBatchKey({
+    provider: input.provider,
+    scopeFingerprint: input.scopeFingerprint || 'scope-legacy',
+    sourceIdentityHash: hash(input.sourceIdentity),
+    sourceQuerySignature: input.querySignature,
+    resumeHash: hash(input.resumeState),
+    requestedUpstreamLimit: input.requestedUpstreamLimit,
+  });
 }
 
 function remember(key: string, value: ProviderBatchResult, ttl: number): void {
@@ -55,6 +64,7 @@ export async function fetchProviderBatchCached(input: {
   ttl?: number;
   bypass?: boolean;
   useRedis?: boolean;
+  scopeFingerprint?: string;
 }): Promise<ProviderBatchResult> {
   const key = providerBatchCacheKey(input);
   const configuredTtl = input.ttl ?? (parseInt(process.env.CATALOG_PROVIDER_BATCH_TTL || '300', 10) || 300);
@@ -106,4 +116,8 @@ export function clearProviderBatchCacheForTests(): void {
 
 export function providerBatchMemoryExpiryForTests(key: string): number | undefined {
   return memory.get(key)?.expiresAt;
+}
+
+export function providerBatchCacheSizeForTests(): number {
+  return memory.size;
 }

@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Catalog pagination now uses `canonical-v6` pages with exact offset/page-index/cursor boundary resumes, `catalog-cursor:v6` delivery history keys, and `canonical-terminal:v6` end markers. Item-level delivery resumes can no longer shift persisted canonical pages after cache eviction.
-- Runtime and warmup share `provider-batch:v3` batches through a strict structured provider contract and in-process single-flight. Provider errors are thrown, Trakt Recommendations declares its native 50-item geometry, and fixed-page EOF rules are adapter-specific.
+- Catalog paging now uses scoped `canonical-v7` pages, `catalog-cursor:v7` delivery history, `canonical-terminal:v7` end markers, and `provider-batch:v4` batches. Personal and merged catalogs include hashed account or user-configuration scope, while verified public sources remain reusable across users.
+- Fixed-page provenance is retained from raw provider indexes before metadata reconstruction. Merged source pages no longer contain delivery filters or use a mutable internal cursor, and StremThru transport or response errors can no longer become cached EOF markers.
 - Source-query and delivery-cursor signatures are separate, so local watched/release/age/exclusion filters invalidate delivery cursors without forking canonical source pages.
 - Catalog, terminal, and provider-batch reads cap excessive TTLs but never extend a shorter remaining TTL.
 - MDBList raw item caches remain typed and split payloads retain the complete consumed raw count. Old v5/v2 paging keys are not read and expire naturally; unrelated metadata, mapping, genre, poster, TMDB, and TVDB caches remain valid.

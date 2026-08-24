@@ -1,7 +1,11 @@
 import { createHash } from 'node:crypto';
+import {
+  CATALOG_CANONICAL_CACHE_VERSION,
+  CATALOG_CANONICAL_PAGE_SCHEMA,
+  CATALOG_DELIVERY_ONLY_KEYS,
+} from './catalogCacheIdentity';
 
-export const CATALOG_CANONICAL_CACHE_VERSION = 'canonical-v6';
-export const CATALOG_CANONICAL_PAGE_SCHEMA = 'v6';
+export { CATALOG_CANONICAL_CACHE_VERSION, CATALOG_CANONICAL_PAGE_SCHEMA } from './catalogCacheIdentity';
 
 export type CatalogExhaustion = 'confirmed' | 'not-exhausted' | 'unknown';
 
@@ -77,7 +81,7 @@ export interface MissingPageRange {
 export interface CanonicalCatalogPage {
   metas: any[];
   _canonical: {
-    schema: 'v6';
+    schema: typeof CATALOG_CANONICAL_PAGE_SCHEMA;
     page: number;
     sourceStart: ProviderResumeState;
     sourceNext: ProviderResumeState;
@@ -88,7 +92,7 @@ export interface CanonicalCatalogPage {
 }
 
 export interface CanonicalTerminalState {
-  schema: 'v6';
+  schema: typeof CATALOG_CANONICAL_PAGE_SCHEMA;
   sourceEnd: ProviderResumeState;
   lastCanonicalPage: number;
 }
@@ -110,30 +114,7 @@ function positiveInteger(value: number, fallback: number): number {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
-const DELIVERY_ONLY_KEYS = new Set([
-  'skip',
-  'limit',
-  'page',
-  '_pageSize',
-  '_pageOffset',
-  '_catalogPaging',
-  '_canonicalPageSize',
-  '_querySignature',
-  '_mdblistPaging',
-  'ageRating',
-  'allowUnratedContent',
-  'hideUnreleasedDigital',
-  'hideUnreleasedShows',
-  'hideWatched',
-  'hideWatchedTrakt',
-  'hideWatchedAnilist',
-  'hideWatchedMdblist',
-  'hideWatchedSimkl',
-  'exclusionKeywords',
-  'regexExclusionFilter',
-  'exclusionGenres',
-  'randomizePerPage',
-]);
+const DELIVERY_ONLY_KEYS = new Set(CATALOG_DELIVERY_ONLY_KEYS);
 
 function stableValue(value: any, omittedKeys: Set<string> = new Set()): any {
   if (Array.isArray(value)) return value.map(child => stableValue(child, omittedKeys));
@@ -160,6 +141,7 @@ export function buildCatalogSourceQuerySignature(input: {
   args?: Record<string, unknown>;
   catalogConfig?: any;
   configFingerprint?: unknown;
+  cacheScopeFingerprint?: string;
 }): string {
   const args = { ...(input.args || {}) };
   for (const key of DELIVERY_ONLY_KEYS) delete (args as any)[key];
@@ -169,6 +151,7 @@ export function buildCatalogSourceQuerySignature(input: {
     type: input.type,
     language: input.language || '',
     canonicalPageSize: positiveInteger(input.canonicalPageSize, 20),
+    cacheScopeFingerprint: input.cacheScopeFingerprint || 'scope-legacy',
     args,
     catalogConfig: input.catalogConfig ? stableValue(input.catalogConfig, sourceOmissions) : null,
     configFingerprint: input.configFingerprint ? stableValue(input.configFingerprint, sourceOmissions) : null,

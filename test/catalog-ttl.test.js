@@ -48,7 +48,7 @@ test('TTL does not change content signatures or provider batch namespaces', () =
   assert.equal(providerBatchCacheKey({
     provider: 'mdblist', sourceIdentity: 'source', querySignature: 'query',
     resumeState: { kind: 'offset', offset: 0 }, requestedUpstreamLimit: 20,
-  }).startsWith('provider-batch:v3:'), true);
+  }).startsWith('provider-batch:v4:'), true);
 });
 
 test('Redis TTL caps never extend catalog or terminal lifetimes on reads', async () => {

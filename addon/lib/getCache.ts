@@ -22,6 +22,7 @@ const {
   normalizeReleaseAvailabilityInPayload,
 }: any = require('../utils/releaseAvailability');
 const { capRedisTtl }: any = require('./catalogTtl');
+const { buildCanonicalCatalogKey }: any = require('./catalogCacheIdentity');
 
 function hashConfig(configObj: any): string {
   const str = typeof configObj === 'string' ? configObj : stableStringify(configObj);
@@ -1443,7 +1444,11 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
 
   let key: string;
   if (options.canonicalSourceSignature) {
-    key = `catalog:canonical-v6:${options.canonicalSourceSignature}:${catalogKey}`;
+    key = buildCanonicalCatalogKey({
+      scopeFingerprint: options.catalogCacheScopeFingerprint || 'scope-legacy',
+      sourceQuerySignature: options.canonicalSourceSignature,
+      catalogKey,
+    });
   } else if (isAuthCatalog) {
     const sessionId = config.sessionId || '';
     key = `catalog:${sessionId}:${configHash}:${catalogKey}`;

@@ -545,9 +545,9 @@ These caps bound the per-process heap used by module-level caches. The defaults 
 - **Description**: Canonical internal catalog cache-page size. All clients share these pages regardless of requested response limit. In `fixed` mode this is also the client response limit.
 - **Example**: `CATALOG_LIST_ITEMS_SIZE=20`
 
-Canonical pages use the `canonical-v6` namespace and store only trusted provider resumes at canonical page boundaries. Runtime requests and cache warmup therefore read and write the same pages even when client response limits or local delivery filters differ. Catalog `cacheTTL` is expiration policy only and is not part of the content key.
+Canonical pages use the `canonical-v7` namespace and store only trusted provider resumes at canonical page boundaries. Runtime requests and cache warmup resolve the same central cache scope: verified public sources use `public`, account-backed sources use a hashed account fingerprint, and configuration-dependent sources use a hashed user-configuration fingerprint. Secrets are never present in cache keys. Catalog `cacheTTL` is expiration policy only and is not part of the content key.
 
-`canonical-v6`, `catalog-cursor:v6`, `canonical-terminal:v6`, and `provider-batch:v3` intentionally ignore older v5/v2 paging data. The migration prevents shifted pages, intra-page boundary resumes, cached provider failures, and old TTL semantics from being reused; old keys expire naturally, while meta, mapping, genre, poster, TMDB, and TVDB caches remain untouched.
+`canonical-v7`, `catalog-cursor:v7`, `canonical-terminal:v7`, and `provider-batch:v4` intentionally ignore older v6/v3 paging data. This targeted migration prevents globally unscoped personal pages, filtered merged pages, reconstructed meta-index provenance, and StremThru error-derived terminal markers from being reused. Old keys expire naturally; meta, mapping, genre, poster, TMDB, and TVDB caches remain untouched.
 
 ### `CATALOG_PROVIDER_BATCH_TTL`
 - **Default**: `300`

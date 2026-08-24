@@ -10,11 +10,12 @@ import {
   type ReconstructedCatalogEntry,
 } from './catalogFetchPlanner';
 import { credentialFingerprint, fetchProviderBatchCached } from './providerBatchCache';
+import { reconstructedEntriesFromRawItems } from './catalogProvenance';
 
 export interface ProviderPageResult {
   metas: any[];
   rawCount: number;
-  entries?: ReconstructedCatalogEntry[];
+  entries: ReconstructedCatalogEntry[];
   resumeAfterBatch: ProviderResumeState;
   exhaustion: CatalogExhaustion;
   total?: number;
@@ -46,6 +47,8 @@ export interface AdapterContext {
   forceRefresh?: boolean;
   useRedisBatchCache?: boolean;
   providerBatchTtl?: number;
+  cacheScopeFingerprint?: string;
+  cacheScopeKind?: 'public' | 'account' | 'user-config';
   fetchOffsetBatch?: (resume: ProviderResumeState, requestedRawCount: number) => Promise<ProviderBatchResult>;
   fetchPage: (page: number, nativePageSize: number) => Promise<ProviderPageResult>;
 }
@@ -170,15 +173,10 @@ export function createFixedPageAdapter(input: {
       throw new Error(`${input.providerId} returned an incomplete provider page contract`);
     }
     const exhaustion = output.exhaustion;
-    const pageSpan = exhaustion === 'confirmed' && output.rawCount > 0 ? output.rawCount : input.nativePageSize;
-    const entries = output.entries || output.metas.map((meta, index) => ({
-      meta,
-      sourcePosition: { kind: 'page-index' as const, page, index },
-      resumeAfter: index + 1 >= pageSpan
-        ? { kind: 'page-index' as const, page: page + 1, index: 0 }
-        : { kind: 'page-index' as const, page, index: index + 1 },
-    }));
-    return { entries, rawCount: output.rawCount, resumeAfterBatch: output.resumeAfterBatch, exhaustion };
+    if (!Array.isArray(output.entries) || output.entries.length !== output.metas.length) {
+      throw new Error(`${input.providerId} returned fixed-page metas without raw provenance`);
+    }
+    return { entries: output.entries, rawCount: output.rawCount, resumeAfterBatch: output.resumeAfterBatch, exhaustion };
   };
 }
 
@@ -198,6 +196,9 @@ export function providerPageResultFromHandler(input: {
   if (!info || !Number.isInteger(info.rawCount) || info.rawCount < 0) {
     throw new Error(`${input.catalogId} did not report rawCount from its provider response`);
   }
+  if (Array.isArray(info.rawItems) && info.rawItems.length !== info.rawCount) {
+    throw new Error(`${input.catalogId} rawItems length does not match rawCount`);
+  }
   const exhaustion = resolveFixedPageExhaustion({
     rawCount: info.rawCount,
     nativePageSize: input.nativePageSize,
@@ -216,10 +217,23 @@ export function providerPageResultFromHandler(input: {
   if (!isProviderResumeState(resumeAfterBatch)) {
     throw new Error(`${input.catalogId} did not report a valid provider resume state`);
   }
+  const entries = Array.isArray(info.entries)
+    ? info.entries
+    : reconstructedEntriesFromRawItems({
+      rawItems: Array.isArray(info.rawItems)
+        ? info.rawItems
+        : (info.rawCount === input.metas.length ? input.metas : []),
+      metas: input.metas,
+      providerPage: input.page,
+      nativePageSize: input.nativePageSize,
+    });
+  if (entries.length !== input.metas.length) {
+    throw new Error(`${input.catalogId} did not preserve raw provenance for every reconstructed meta`);
+  }
   return {
     metas: input.metas,
     rawCount: info.rawCount,
-    entries: info.entries,
+    entries,
     resumeAfterBatch,
     exhaustion,
     hasMore: info.hasMore,
@@ -235,8 +249,8 @@ function sourceIdentity(context: AdapterContext, provider: string): string {
     type: context.type,
     language: context.language,
     genre: context.genre || '',
-    userUUID: context.userUUID || '',
-    credential: credentialFingerprint(context.credential),
+    scope: context.cacheScopeFingerprint || 'scope-legacy',
+    credential: context.cacheScopeKind === 'public' ? 'public' : credentialFingerprint(context.credential),
   });
 }
 
@@ -250,6 +264,7 @@ export function createCatalogSourceAdapter(context: AdapterContext): CatalogSour
     bypass: context.forceRefresh === true,
     useRedis: context.useRedisBatchCache,
     ttl: context.providerBatchTtl,
+    scopeFingerprint: context.cacheScopeFingerprint || 'scope-legacy',
   };
 
   if (definition.capabilities.supportsVariableLimit && context.fetchOffsetBatch) {

@@ -66,6 +66,7 @@ async function getTrending(type: string, language: string, page: number, genre: 
     return {
       metas: attachProviderPageMetadata(validMetas, {
         rawCount: (res?.results || []).length,
+        rawItems: res?.results || [],
         hasMore: Number(res?.page || page) < Number(res?.total_pages || 1),
         total: res?.total_results,
       }),

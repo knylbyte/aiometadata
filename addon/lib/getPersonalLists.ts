@@ -165,6 +165,7 @@ async function getPersonalList(
     return {
       metas: attachProviderPageMetadata(validMetas, {
         rawCount: sortedResults.length,
+        rawItems: sortedResults,
         hasMore: Number(res?.page || page) < Number(res?.total_pages || 1),
         total: res?.total_results,
       }),

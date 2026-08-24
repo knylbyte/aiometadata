@@ -160,14 +160,14 @@ async function fetchStremThruCatalog(catalogUrl, skip = 0, genre) {
     }
     
     const data = await _makeRequest(url);
-    if (!data || !data.metas) {
-      logger.warn(`Invalid response format from ${catalogUrl}`);
-      return [];
+    if (!data || typeof data !== 'object' || !Array.isArray(data.metas)) {
+      throw Object.assign(new Error(`Invalid catalog response format from ${catalogUrl}`), { status: 502 });
     }
     logger.debug(`Successfully fetched ${data.metas.length} items from catalog (skip: ${skip}, genre: ${genre || 'all'})`);
     return data.metas;
   } catch (err) {
-    return [];
+    logger.error(`Failed to fetch catalog ${catalogUrl}:`, err.message);
+    throw err;
   }
 }
 

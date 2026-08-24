@@ -29,6 +29,16 @@ const {
 
 const metas = (start, count) => Array.from({ length: count }, (_, index) => ({ id: `id-${start + index}` }));
 
+function fixedPageEntries(page, pageMetas, nativePageSize) {
+  return pageMetas.map((meta, index) => ({
+    meta,
+    sourcePosition: { kind: 'page-index', page, index },
+    resumeAfter: index + 1 < nativePageSize
+      ? { kind: 'page-index', page, index: index + 1 }
+      : { kind: 'page-index', page: page + 1, index: 0 },
+  }));
+}
+
 function memoryState(initial = new Map(), initialTerminal = null) {
   const pages = new Map(initial);
   let terminal = initialTerminal;
@@ -146,8 +156,10 @@ test('AniList native pages of 50 split into canonical pages of 20 without gaps',
     useRedisBatchCache: false,
     fetchPage: async page => {
       providerCalls.push(page);
+      const pageMetas = metas((page - 1) * 50, 50);
       return {
-        metas: metas((page - 1) * 50, 50),
+        metas: pageMetas,
+        entries: fixedPageEntries(page, pageMetas, 50),
         rawCount: 50,
         exhaustion: page === 2 ? 'confirmed' : 'not-exhausted',
         resumeAfterBatch: { kind: 'page-index', page: page + 1, index: 0 },
@@ -165,7 +177,7 @@ test('AniList native pages of 50 split into canonical pages of 20 without gaps',
   state.pages.delete(3);
   await hydrate(state, adapter, 40, 20);
   assert.deepEqual(state.pages.get(3).metas.map(meta => meta.id), metas(40, 20).map(meta => meta.id));
-  assert.deepEqual(providerCalls, [1, 2], 'provider page 1/2 should come from provider-batch:v2');
+  assert.deepEqual(providerCalls, [1, 2], 'provider page 1/2 should come from provider-batch:v4');
   assert.equal(getCatalogProviderDefinition({ catalogId: 'anilist.discover.test', canonicalPageSize: 20 }).capabilities.nativePageSize, 50);
 });
 
@@ -232,7 +244,7 @@ test('an exact full batch with explicit exhaustion writes a terminal marker with
   assert.equal(result.exhausted, true);
   assert.equal(state.pages.get(1)._canonical.exhausted, true);
   assert.deepEqual(state.getTerminal(), {
-    schema: 'v6',
+    schema: 'v7',
     sourceEnd: { kind: 'offset', offset: 20 },
     lastCanonicalPage: 1,
   });
@@ -373,7 +385,7 @@ test('failed provider batches are not retained by the single-flight cache', asyn
 
 test('a terminal marker suppresses requests beyond the confirmed final page', async () => {
   const state = memoryState(new Map(), {
-    schema: 'v6',
+    schema: 'v7',
     sourceEnd: { kind: 'offset', offset: 125 },
     lastCanonicalPage: 7,
   });
@@ -422,11 +434,11 @@ test('fixed and cursor providers are fetched sequentially using adapter-native g
   }
 });
 
-test('v5 pages are not read as v6 and response limits do not fork canonical keys', async () => {
+test('v6 pages are not read as v7 and response limits do not fork canonical keys', async () => {
   const oldPage = {
     metas: metas(900, 20),
     _canonical: {
-      schema: 'v5', page: 1,
+      schema: 'v6', page: 1,
       sourceStart: { kind: 'offset', offset: 0 },
       sourceNext: { kind: 'offset', offset: 20 },
       exhausted: false, entryResumes: [],
@@ -450,7 +462,7 @@ test('v5 pages are not read as v6 and response limits do not fork canonical keys
     querySignature: 'query',
     resumeState: { kind: 'offset', offset: 0 },
     requestedUpstreamLimit: 20,
-  }).startsWith('provider-batch:v3:'), true);
+  }).startsWith('provider-batch:v4:'), true);
 });
 
 test('FlixPatrol Top 10 confirms EOF on its successful empty second page', async () => {
@@ -464,6 +476,7 @@ test('FlixPatrol Top 10 confirms EOF on its successful empty second page', async
       const pageMetas = page === 1 ? metas(0, 10) : [];
       return {
         metas: pageMetas,
+        entries: fixedPageEntries(page, pageMetas, 10),
         rawCount: pageMetas.length,
         resumeAfterBatch: { kind: 'page-index', page: page + 1, index: 0 },
         exhaustion: page === 2 ? 'confirmed' : 'unknown',
@@ -488,6 +501,7 @@ test('a configured short fixed page confirms EOF without an extra empty request'
       const pageMetas = page === 1 ? metas(0, 20) : metas(20, 7);
       return {
         metas: pageMetas,
+        entries: fixedPageEntries(page, pageMetas, 20),
         rawCount: pageMetas.length,
         resumeAfterBatch: { kind: 'page-index', page: page + 1, index: 0 },
         exhaustion: page === 2 ? 'confirmed' : 'not-exhausted',
@@ -518,8 +532,10 @@ test('Trakt Recommendations uses native pages of 50 without losing IDs 20-49', a
     querySignature: 'trakt-recommendations', type: 'movie', language: 'en-US', useRedisBatchCache: false,
     fetchPage: async (page, nativePageSize) => {
       calls.push({ page, nativePageSize });
+      const pageMetas = metas((page - 1) * 50, 50);
       return {
-        metas: metas((page - 1) * 50, 50),
+        metas: pageMetas,
+        entries: fixedPageEntries(page, pageMetas, 50),
         rawCount: 50,
         hasMore: page < 2,
         resumeAfterBatch: { kind: 'page-index', page: page + 1, index: 0 },

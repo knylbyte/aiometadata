@@ -247,6 +247,10 @@ export async function getFlixPatrolMetas(
     value: chart.entries.length,
     enumerable: false,
   });
+  Object.defineProperty(validMetas, '_rawItems', {
+    value: chart.entries,
+    enumerable: false,
+  });
   logger.debug(`Resolved ${validMetas.length}/${chart.entries.length} entries for ${chart.catalog_id}`);
   return validMetas;
 }

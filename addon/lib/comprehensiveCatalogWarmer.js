@@ -9,8 +9,9 @@ const {
   writeMetaComponentsBatchWithConfig,
 } = require('./getCache');
 const { fixedCatalogPageSize } = require('./catalogPageSize');
-const { buildCanonicalCatalogCacheArgs, buildCatalogSourceQuerySignature, hydrateCanonicalPageWindow, resolveCanonicalPageWindow, writeCanonicalPages } = require('./catalogFetchPlanner');
+const { buildCanonicalCatalogCacheArgs, buildCatalogSourceQuerySignature, CATALOG_CANONICAL_CACHE_VERSION, hydrateCanonicalPageWindow, resolveCanonicalPageWindow, writeCanonicalPages } = require('./catalogFetchPlanner');
 const { attachProviderPageMetadata, createCatalogSourceAdapter, getCatalogProviderDefinition, providerPageResultFromHandler } = require('./catalogSourceAdapter');
+const { buildCatalogScopeFingerprint, resolveCatalogCacheScope } = require('./catalogCacheIdentity');
 const { resolveEffectiveCatalogTtl } = require('./catalogTtl');
 const { readCatalogTerminal, terminalKey, writeCatalogTerminal } = require('./catalogPagination');
 const { getGenreList } = require('./getGenreList');
@@ -875,6 +876,15 @@ class ComprehensiveCatalogWarmer {
             pagesThisPass * canonicalPageSize,
             canonicalPageSize
           );
+          const catalogCacheScope = resolveCatalogCacheScope({
+            cleanId: catalogId,
+            catalogConfig,
+            config,
+            userUUID: uuid,
+            provider: providerDefinition.provider,
+            sourceUrl: catalogConfig?.sourceUrl,
+          });
+          const catalogCacheScopeFingerprint = buildCatalogScopeFingerprint(catalogCacheScope);
           const querySignature = buildCatalogSourceQuerySignature({
             catalogId,
             type: actualType,
@@ -882,21 +892,19 @@ class ComprehensiveCatalogWarmer {
             canonicalPageSize,
             args: extraArgs || {},
             catalogConfig,
+            cacheScopeFingerprint: catalogCacheScopeFingerprint,
             configFingerprint: {
               sfw: config.sfw,
               includeAdult: config.includeAdult,
               timezone: config.timezone,
               providers: config.providers || null,
-              accountScope: /^(trakt|anilist|simkl|movielens|publicmetadb|tmdb\.(watchlist|favorites))\./.test(catalogId)
-                ? uuid
-                : null,
             },
           });
-          const catalogTerminalKey = terminalKey(uuid, querySignature);
+          const catalogTerminalKey = terminalKey(catalogCacheScopeFingerprint, querySignature);
           const keyForPage = (page) => {
             const pageArgs = buildCanonicalCatalogCacheArgs(extraArgs || {}, page, canonicalPageSize, querySignature);
             if (catalogId.startsWith('mdblist.') && usesMdblistExternalItemsEndpoint(catalogConfig)) {
-              pageArgs._mdblistPaging = 'typed-canonical-v6';
+              pageArgs._mdblistPaging = `typed-${CATALOG_CANONICAL_CACHE_VERSION}`;
             }
             return `${catalogId}:${actualType}:${stableStringify(pageArgs)}`;
           };
@@ -1002,6 +1010,8 @@ class ComprehensiveCatalogWarmer {
               ? (config.apiKeys?.mdblist || process.env.MDBLIST_API_KEY || process.env.BUILT_IN_MDBLIST_API_KEY || '')
               : undefined,
             providerBatchTtl: resolveEffectiveCatalogTtl({ catalogConfig }).providerBatchTtl,
+            cacheScopeFingerprint: catalogCacheScopeFingerprint,
+            cacheScopeKind: catalogCacheScope.kind,
             fetchPage: async (page, nativePageSize) => {
               const result = await fetchWarmPage(page);
               const metas = result?.metas || [];
@@ -1049,6 +1059,7 @@ class ComprehensiveCatalogWarmer {
               config,
               effectiveCatalogTtl: catalogTtlPolicy.canonicalPageTtl,
               canonicalSourceSignature: querySignature,
+              catalogCacheScopeFingerprint,
               onHit: () => {
                 this.stats.pagesFromCache++;
                 if (this.stats.uuidStats[uuid]) this.stats.uuidStats[uuid].pagesFromCache++;
@@ -1060,6 +1071,7 @@ class ComprehensiveCatalogWarmer {
               config,
               effectiveCatalogTtl: catalogTtlPolicy.canonicalPageTtl,
               canonicalSourceSignature: querySignature,
+              catalogCacheScopeFingerprint,
             }),
             writePages: pages => writeCanonicalPages(pages, (page, value) =>
               cacheWrapCatalog(uuid, keyForPage(page), async () => value, {
@@ -1068,6 +1080,7 @@ class ComprehensiveCatalogWarmer {
                 config,
                 effectiveCatalogTtl: catalogTtlPolicy.canonicalPageTtl,
                 canonicalSourceSignature: querySignature,
+                catalogCacheScopeFingerprint,
               })
             ),
             readTerminal: () => readCatalogTerminal(catalogTerminalKey, catalogTtlPolicy.terminalTtl),
@@ -1123,6 +1136,7 @@ class ComprehensiveCatalogWarmer {
     while (pagesWarmed < maxPages) {
       try {
         const fullResult = await getCatalog(catalog.type, config.language, 1, catalogId, genreValue || null, configWithUUID, uuid, true, currentSkip);
+        const rawCount = fullResult?.metas?._providerPageInfo?.rawCount;
         const result = await this.persistFullMetasAndProjectCatalog(fullResult, configWithUUID, catalog.type);
 
         const rawMetaCount = result?.metas?.length || 0;
@@ -1139,14 +1153,8 @@ class ComprehensiveCatalogWarmer {
         totalItems += rawMetaCount;
         pagesWarmed++;
 
-        const cursorKey = `catalog-cursor:${uuid}:${catalogId}:${catalog.type}:${genreValue || 'all'}`;
-        const raw = await redis.get(cursorKey);
-        if (raw) {
-          const cursor = JSON.parse(raw);
-          currentSkip = cursor.served;
-        } else {
-          break;
-        }
+        if (!Number.isInteger(rawCount) || rawCount <= 0) break;
+        currentSkip += rawCount;
 
         await this.delay(this.config.taskDelayMs);
       } catch (error) {
